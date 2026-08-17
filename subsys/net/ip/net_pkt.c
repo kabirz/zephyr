@@ -129,6 +129,29 @@ BUILD_ASSERT(CONFIG_NET_BUF_DATA_SIZE >= 96);
 #error "Minimum value for CONFIG_NET_BUF_TX_COUNT is 1"
 #endif
 
+#if defined(CONFIG_NET_PKT_DTCM)
+/*
+ * DTCM pool variants: see net_pkt_dtcm.h (DTCM not DMA-accessible,
+ * only valid with programmed-IO network drivers).
+ */
+#include "net_pkt_dtcm.h"
+
+NET_PKT_SLAB_DEFINE_DTCM(rx_pkts, CONFIG_NET_PKT_RX_COUNT);
+NET_PKT_SLAB_DEFINE_DTCM(tx_pkts, CONFIG_NET_PKT_TX_COUNT);
+
+#if defined(CONFIG_NET_BUF_FIXED_DATA_SIZE)
+
+NET_BUF_POOL_FIXED_DEFINE_DTCM(rx_bufs, CONFIG_NET_BUF_RX_COUNT, CONFIG_NET_BUF_DATA_SIZE,
+			       CONFIG_NET_PKT_BUF_USER_DATA_SIZE, NULL);
+NET_BUF_POOL_FIXED_DEFINE_DTCM(tx_bufs, CONFIG_NET_BUF_TX_COUNT, CONFIG_NET_BUF_DATA_SIZE,
+			       CONFIG_NET_PKT_BUF_USER_DATA_SIZE, NULL);
+
+#else /* !CONFIG_NET_BUF_FIXED_DATA_SIZE */
+#error "CONFIG_NET_PKT_DTCM requires CONFIG_NET_BUF_FIXED_DATA_SIZE"
+#endif /* CONFIG_NET_BUF_FIXED_DATA_SIZE */
+
+#else /* !CONFIG_NET_PKT_DTCM */
+
 NET_PKT_SLAB_DEFINE(rx_pkts, CONFIG_NET_PKT_RX_COUNT);
 NET_PKT_SLAB_DEFINE(tx_pkts, CONFIG_NET_PKT_TX_COUNT);
 
@@ -150,6 +173,7 @@ NET_BUF_POOL_VAR_ALIGN_DEFINE(tx_bufs, CONFIG_NET_BUF_TX_COUNT,
 			      CONFIG_NET_PKT_BUF_TX_DATA_ALLOC_ALIGN_LEN);
 
 #endif /* CONFIG_NET_BUF_FIXED_DATA_SIZE */
+#endif /* CONFIG_NET_PKT_DTCM */
 
 /* Allocation tracking is only available if separately enabled */
 #if defined(CONFIG_NET_DEBUG_NET_PKT_ALLOC)
