@@ -77,7 +77,15 @@ LOG_MODULE_REGISTER(net_ctx, CONFIG_NET_CONTEXT_LOG_LEVEL);
 
 #define NET_MAX_CONTEXT CONFIG_NET_MAX_CONTEXTS
 
+#if defined(CONFIG_NET_PKT_DTCM)
+/* Context array in DTCM (.dtcm_noinit): entries are fully initialized
+ * on first use (net_context_init), noinit semantics are equivalent.
+ * See net_pkt_dtcm.h for the DTCM/DMA restriction. */
+#include "net_pkt_dtcm.h"
+NET_DEFINE_DTCM(struct net_context, contexts, NET_MAX_CONTEXT);
+#else
 static struct net_context contexts[NET_MAX_CONTEXT];
+#endif
 
 /* We need to lock the contexts array as these APIs are typically called
  * from applications which are usually run in task context.

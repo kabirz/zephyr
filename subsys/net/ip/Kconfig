@@ -753,6 +753,22 @@ config NET_BUF_DATA_SIZE
 	help
 	  This value tells what is the fixed size of each network buffer.
 
+config NET_PKT_DTCM
+	bool "Place network packet buffers in DTCM"
+	depends on ARM && NET_BUF_FIXED_DATA_SIZE
+	help
+	  Place the rx/tx net_pkt slabs and the rx/tx net_buf pools
+	  (metadata and data) in the DTCM section (.dtcm_noinit) as
+	  provided by the zephyr,dtcm chosen node (e.g. STM32 CCM RAM).
+	  This frees the same amount of SRAM for other uses.
+
+	  DTCM is only accessible by the CPU, not by DMA. This option may
+	  only be used when all network device drivers in the system use
+	  programmed I/O (no DMA), or when the driver copies data between
+	  its own DMA-safe buffers and the network buffers. Enabling it
+	  with a DMA-based driver will cause transfer errors / data
+	  corruption.
+
 config NET_PKT_BUF_RX_DATA_POOL_SIZE
 	int "Size of the RX memory pool where buffers are allocated from"
 	default 4096 if NET_L2_ETHERNET
