@@ -758,9 +758,12 @@ config NET_PKT_DTCM
 	depends on ARM && NET_BUF_FIXED_DATA_SIZE
 	help
 	  Place the rx/tx net_pkt slabs and the rx/tx net_buf pools
-	  (metadata and data) in the DTCM section (.dtcm_noinit) as
+	  (metadata and data) in the DTCM section (.dtcm_bss) as
 	  provided by the zephyr,dtcm chosen node (e.g. STM32 CCM RAM).
 	  This frees the same amount of SRAM for other uses.
+
+	  Uses .dtcm_bss (not noinit) so that arch_bss_zero() clears
+	  these pools on warm reboot (watchdog / soft reset).
 
 	  DTCM is only accessible by the CPU, not by DMA. This option may
 	  only be used when all network device drivers in the system use

@@ -6,8 +6,12 @@
  *
  * When CONFIG_NET_PKT_DTCM is set, the rx/tx net_pkt slabs, the rx/tx
  * net_buf pools (metadata + data) and the net_context array are placed
- * in the .dtcm_noinit section provided by the zephyr,dtcm chosen node
+ * in the .dtcm_bss section provided by the zephyr,dtcm chosen node
  * (e.g. STM32F4 CCM RAM). This frees the same amount of SRAM.
+ *
+ * .dtcm_bss (not noinit) is used so that arch_bss_zero() clears these
+ * pools on warm reboot (watchdog / soft reset). Without this, stale
+ * net_pkt / net_context data in DTCM causes EADDRINUSE bind failures.
  *
  * Restriction: DTCM is only accessible by the CPU, not by DMA. Only
  * valid when all network device drivers use programmed I/O. See
@@ -31,16 +35,16 @@ extern "C" {
 #if defined(CONFIG_NET_PKT_DTCM)
 
 /* Upstream K_MEM_SLAB_DEFINE() hardcodes __noinit_named(); use the
- * _IN_SECT form to point the slab buffer at .dtcm_noinit while the
+ * _IN_SECT form to point the slab buffer at .dtcm_bss while the
  * k_mem_slab descriptor itself stays wherever STRUCT_SECTION_ITERABLE
  * places it. */
 #define NET_PKT_SLAB_DEFINE_DTCM(name, count)					     \
-	K_MEM_SLAB_DEFINE_IN_SECT(name, __dtcm_noinit_section,			     \
+	K_MEM_SLAB_DEFINE_IN_SECT(name, __dtcm_bss_section,			     \
 				  sizeof(struct net_pkt), count, 4);		     \
 	NET_PKT_ALLOC_STATS_DEFINE(pkt_alloc_stats_##name, name)
 
 /* Mirror of _NET_BUF_ARRAY_DEFINE() from net_buf.h with the metadata
- * array in .dtcm_noinit. Keep in sync with upstream when updating. */
+ * array in .dtcm_bss. Keep in sync with upstream when updating. */
 #define _NET_BUF_ARRAY_DEFINE_IN_DTCM(_name, _count, _ud_size)			       \
 	struct _net_buf_##_name { uint8_t b[sizeof(struct net_buf)];		       \
 				  uint8_t ud[_ud_size]; } __net_buf_align;	       \
@@ -52,14 +56,14 @@ extern "C" {
 	BUILD_ASSERT(sizeof(struct _net_buf_##_name) ==			       \
 		     ROUND_UP(sizeof(struct net_buf) + _ud_size, __alignof__(struct net_buf)), \
 		     "Size cannot be determined");				       \
-	static struct _net_buf_##_name _net_buf_##_name[_count] __dtcm_noinit_section
+	static struct _net_buf_##_name _net_buf_##_name[_count] __dtcm_bss_section
 
 /* Mirror of NET_BUF_POOL_FIXED_DEFINE() from net_buf.h with the
- * metadata array and the data array in .dtcm_noinit. Keep in sync with
+ * metadata array and the data array in .dtcm_bss. Keep in sync with
  * upstream when updating. */
 #define NET_BUF_POOL_FIXED_DEFINE_DTCM(_name, _count, _data_size, _ud_size, _destroy)     \
 	_NET_BUF_ARRAY_DEFINE_IN_DTCM(_name, _count, _ud_size);		       \
-	static uint8_t __dtcm_noinit_section					       \
+	static uint8_t __dtcm_bss_section					       \
 	net_buf_data_##_name[_count][_data_size] __net_buf_align;		       \
 	static const struct net_buf_pool_fixed net_buf_fixed_##_name = {	       \
 		.data_pool = (uint8_t *)net_buf_data_##_name,			       \
@@ -74,10 +78,9 @@ extern "C" {
 					 _net_buf_##_name, _count, _ud_size,	       \
 					 _destroy)
 
-/* Array of plain objects (zero-initialized at boot by their users)
- * placed in .dtcm_noinit. */
+/* Array of plain objects placed in .dtcm_bss (zeroed on warm reboot). */
 #define NET_DEFINE_DTCM(_type, _name, _count)					       \
-	static _type __dtcm_noinit_section _name[_count]
+	static _type __dtcm_bss_section _name[_count]
 
 #endif /* CONFIG_NET_PKT_DTCM */
 
