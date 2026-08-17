@@ -505,7 +505,7 @@ static inline uint32_t uart_stm32_cfg2ll_databits(enum uart_config_data_bits db,
 	case UART_CFG_DATA_BITS_8:
 	default:
 #ifdef STM32_USART_DATAWIDTH_9_BIT
-		if (p != UART_CFG_PARITY_NONE) {
+		if (p != UART_CFG_PARITY_NONE && db != UART_CFG_DATA_BITS_7) {
 			return STM32_USART_DATAWIDTH_9_BIT;
 		}
 #endif
@@ -1002,6 +1002,9 @@ static void fifo_read_with_u8(USART_TypeDef *usart, void *rx_data, const int off
 	uint8_t *data = (uint8_t *)rx_data;
 
 	data[offset] = LL_USART_ReceiveData8(usart);
+	if (LL_USART_GetParity(usart) != LL_USART_PARITY_NONE &&
+		LL_USART_GetDataWidth(usart) == LL_USART_DATAWIDTH_8B)
+		data[offset] &= 0x7f;
 }
 
 static int uart_stm32_fifo_read(const struct device *dev, uint8_t *rx_data, const int size)
