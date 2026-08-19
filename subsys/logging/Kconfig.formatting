@@ -239,6 +239,14 @@ config LOG_OUTPUT_FORMAT_CUSTOM_TIMESTAMP
 
 endchoice
 
+config LOG_OUTPUT_TIMEZONE_OFFSET
+	int "Timezone offset in hours from UTC"
+	range -12 14
+	default 0
+	help
+	  Timezone offset applied to log timestamps. For example, set to 8 for UTC+8.
+	  The offset is added to the UTC time from gmtime_r() to display local time.
+
 config LOG_BACKEND_CRLF_NONE
 	bool "Prevent adding CR and LF in logger"
 	help

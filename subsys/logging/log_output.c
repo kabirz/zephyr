@@ -209,7 +209,7 @@ static int timestamp_print(const struct log_output *output,
 #if defined(CONFIG_POSIX_C_LANG_SUPPORT_R)
 			} else if (IS_ENABLED(CONFIG_LOG_OUTPUT_FORMAT_DATE_TIMESTAMP)) {
 				struct tm tm_timestamp = {0};
-				time_t time_seconds = total_seconds;
+				time_t time_seconds = total_seconds + (CONFIG_LOG_OUTPUT_TIMEZONE_OFFSET * 3600);
 
 				gmtime_r(&time_seconds, &tm_timestamp);
 #if defined(CONFIG_REQUIRES_FULL_LIBC)
@@ -229,7 +229,7 @@ static int timestamp_print(const struct log_output *output,
 #endif /* CONFIG_REQUIRES_FULL_LIBC */
 			} else if (IS_ENABLED(CONFIG_LOG_OUTPUT_FORMAT_ISO8601_TIMESTAMP)) {
 				struct tm tm_timestamp = {0};
-				time_t time_seconds = total_seconds;
+				time_t time_seconds = total_seconds + (CONFIG_LOG_OUTPUT_TIMEZONE_OFFSET * 3600);
 
 				gmtime_r(&time_seconds, &tm_timestamp);
 #if defined(CONFIG_REQUIRES_FULL_LIBC)
