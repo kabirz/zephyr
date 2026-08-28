@@ -20,8 +20,14 @@
 /*
  * The GD32H7xx EXTI groups its line registers (22 lines per group, 0x18
  * register stride). Only the group 0 lines (0..21) are handled; this covers
- * all the GPIO capable lines (0..15).
+ * all the GPIO capable lines (0..15). The vendor header defines the
+ * function-like group accessors EXTI_xxx(group); drop them so the
+ * single-register (group 0) names below apply.
  */
+#undef EXTI_INTEN
+#undef EXTI_RTEN
+#undef EXTI_FTEN
+#undef EXTI_PD
 #define EXTI_INTEN EXTI_INTEN0
 #define EXTI_RTEN	EXTI_RTEN0
 #define EXTI_FTEN	EXTI_FTEN0
