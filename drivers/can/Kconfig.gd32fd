@@ -1,0 +1,22 @@
+# Copyright (c) 2026 GD32H7xx Zephyr bring-up
+# SPDX-License-Identifier: Apache-2.0
+
+config CAN_GD32FD
+	bool "GigaDevice GD32H7xx CAN-FD driver"
+	default y
+	depends on DT_HAS_GD_GD32_CAN_ENABLED
+	select PINCTRL
+	select USE_GD32_CAN
+	select CAN_FD_MODE
+	help
+	  Enable the GigaDevice GD32H7xx CAN-FD controller driver. Supports
+	  classic CAN and CAN-FD frames (up to 64 data bytes with bit rate
+	  switching).
+
+config CAN_GD32FD_MAX_FILTER
+	int "Maximum number of concurrent CAN RX software filters"
+	default 8
+	range 1 1024
+	depends on CAN_GD32FD
+	help
+	  Defines the size of the array of software RX filters.

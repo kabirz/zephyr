@@ -1,0 +1,32 @@
+# Copyright (c) 2026 GD32H7xx Zephyr bring-up
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  GigaDevice GD32H7xx CAN-FD controller (mailbox / message RAM based).
+  Interrupt names: wkup, message, busoff, error, fasterror, tec, rec.
+
+compatible: "gd,gd32-can"
+
+include: [can-fd-controller.yaml, reset-device.yaml, pinctrl-device.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  interrupt-names:
+    required: true
+
+  resets:
+    required: true
+
+  clocks:
+    required: true
+
+  pinctrl-0:
+    required: true
+
+  pinctrl-names:
+    required: true
