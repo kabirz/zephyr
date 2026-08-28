@@ -9,9 +9,38 @@
 
 / {
 	soc {
+		/* Instruction TCM */
+		itcm0: memory@0 {
+			compatible = "zephyr,memory-region", "mmio-sram";
+			reg = <0x00000000 DT_SIZE_K(64)>;
+			zephyr,memory-region = "ITCMRAM";
+		};
+
+		/* Data TCM */
+		dtcm0: memory@20000000 {
+			compatible = "zephyr,memory-region", "mmio-sram";
+			reg = <0x20000000 DT_SIZE_K(64)>;
+			zephyr,memory-region = "DTCMRAM";
+		};
+
+		/* Main AXI SRAM (default Zephyr RAM) */
 		sram0: memory@24000000 {
 			compatible = "mmio-sram";
-			reg = <0x24000000 DT_SIZE_K(832)>;
+			reg = <0x24000000 DT_SIZE_K(720)>;
+		};
+
+		/* SRAM0 */
+		sram_per0: memory@30000000 {
+			compatible = "zephyr,memory-region", "mmio-sram";
+			reg = <0x30000000 DT_SIZE_K(16)>;
+			zephyr,memory-region = "SRAM0";
+		};
+
+		/* SRAM1 */
+		sram_per1: memory@30004000 {
+			compatible = "zephyr,memory-region", "mmio-sram";
+			reg = <0x30004000 DT_SIZE_K(16)>;
+			zephyr,memory-region = "SRAM1";
 		};
 	};
 };
