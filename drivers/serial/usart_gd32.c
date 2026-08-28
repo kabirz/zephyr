@@ -51,7 +51,26 @@ struct gd32_usart_data {
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 static void usart_gd32_isr(const struct device *dev)
 {
+	const struct gd32_usart_config *const cfg = dev->config;
 	struct gd32_usart_data *const data = dev->data;
+	uint32_t status = USART_STAT(cfg->reg);
+
+	/*
+	 * Latched error flags (most importantly the overrun flag) share the
+	 * RX interrupt with RBNE and would re-trigger this ISR forever if
+	 * they were not cleared, starving the whole system. The upper layer
+	 * (shell/console) never clears them, so do it here.
+	 *
+	 * Note: USART_FLAG_* values are (register offset << 6 | bit) encoded,
+	 * test the raw STAT bits (USART_STAT_*) and clear through the API.
+	 */
+	if ((status & (USART_STAT_ORERR | USART_STAT_PERR |
+		       USART_STAT_FERR | USART_STAT_NERR)) != 0U) {
+		usart_flag_clear(cfg->reg, USART_FLAG_ORERR);
+		usart_flag_clear(cfg->reg, USART_FLAG_PERR);
+		usart_flag_clear(cfg->reg, USART_FLAG_FERR);
+		usart_flag_clear(cfg->reg, USART_FLAG_NERR);
+	}
 
 	if (data->user_cb) {
 		data->user_cb(dev, data->user_data);
@@ -103,6 +122,12 @@ static int usart_gd32_init(const struct device *dev)
 	usart_word_length_set(cfg->reg, word_length);
 	/* Default to 1 stop bit */
 	usart_stop_bit_set(cfg->reg, USART_STB_1BIT);
+	/*
+	 * Buffer RX/TX bursts in the FIFO. Without it only a single received
+	 * byte is held: escape sequences typed by interactive terminals (ESC [
+	 * A, sent back to back) then overrun and bytes get lost.
+	 */
+	usart_fifo_enable(cfg->reg);
 	usart_receive_config(cfg->reg, USART_RECEIVE_ENABLE);
 	usart_transmit_config(cfg->reg, USART_TRANSMIT_ENABLE);
 	usart_enable(cfg->reg);
