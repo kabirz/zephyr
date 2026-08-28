@@ -1,0 +1,25 @@
+/*
+ * Copyright (c) 2026 GD32H7xx Zephyr bring-up
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <mem.h>
+#include <freq.h>
+#include <gd/gd32h7xx/gd32h7xx.dtsi>
+
+/ {
+	soc {
+		sram0: memory@24000000 {
+			compatible = "mmio-sram";
+			reg = <0x24000000 DT_SIZE_K(832)>;
+		};
+	};
+};
+
+&cpu0 {
+	clock-frequency = <DT_FREQ_M(600)>;
+};
+
+&flash0 {
+	reg = <0x08000000 DT_SIZE_K(3840)>;
+};
