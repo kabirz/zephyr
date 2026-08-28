@@ -102,6 +102,36 @@ static int clock_control_gd32_get_rate(const struct device *dev,
 
 	cfg = sys_read32(config->base + RCU_CFG0_OFFSET);
 
+#if defined(CONFIG_SOC_SERIES_GD32H7XX)
+	switch (GD32_CLOCK_ID_OFFSET(id)) {
+	case RCU_AHB1EN_OFFSET:
+	case RCU_AHB2EN_OFFSET:
+	case RCU_AHB3EN_OFFSET:
+	case RCU_AHB4EN_OFFSET:
+		psc = (cfg & RCU_CFG0_AHBPSC_MSK) >> RCU_CFG0_AHBPSC_POS;
+		*rate = CPU_FREQ >> ahb_exp[psc];
+		break;
+	case RCU_APB1EN_OFFSET:
+		psc = (cfg & RCU_CFG0_APB1PSC_MSK) >> RCU_CFG0_APB1PSC_POS;
+		*rate = CPU_FREQ >> apb1_exp[psc];
+		break;
+	case RCU_APB2EN_OFFSET:
+	case RCU_ADDAPB2EN_OFFSET:
+		psc = (cfg & RCU_CFG0_APB2PSC_MSK) >> RCU_CFG0_APB2PSC_POS;
+		*rate = CPU_FREQ >> apb2_exp[psc];
+		break;
+	case RCU_APB3EN_OFFSET:
+		psc = (cfg & RCU_CFG0_APB3PSC_MSK) >> RCU_CFG0_APB3PSC_POS;
+		*rate = CPU_FREQ >> apb1_exp[psc];
+		break;
+	case RCU_APB4EN_OFFSET:
+		psc = (cfg & RCU_CFG0_APB4PSC_MSK) >> RCU_CFG0_APB4PSC_POS;
+		*rate = CPU_FREQ >> apb1_exp[psc];
+		break;
+	default:
+		return -ENOTSUP;
+	}
+#else
 	switch (GD32_CLOCK_ID_OFFSET(id)) {
 #if defined(CONFIG_SOC_SERIES_GD32F4XX)
 	case RCU_AHB1EN_OFFSET:
@@ -129,6 +159,7 @@ static int clock_control_gd32_get_rate(const struct device *dev,
 	default:
 		return -ENOTSUP;
 	}
+#endif /* CONFIG_SOC_SERIES_GD32H7XX */
 
 #if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_timer)
 	/* handle timer clocks */
@@ -137,7 +168,8 @@ static int clock_control_gd32_get_rate(const struct device *dev,
 			continue;
 		}
 
-#if defined(CONFIG_SOC_SERIES_GD32F4XX)
+#if defined(CONFIG_SOC_SERIES_GD32F4XX) || \
+	defined(CONFIG_SOC_SERIES_GD32H7XX)
 		uint32_t cfg1 = sys_read32(config->base + RCU_CFG1_OFFSET);
 
 		/*
@@ -176,7 +208,7 @@ static int clock_control_gd32_get_rate(const struct device *dev,
 		if (psc != 1U) {
 			*rate *= 2U;
 		}
-#endif /* CONFIG_SOC_SERIES_GD32F4XX */
+#endif /* CONFIG_SOC_SERIES_GD32F4XX || CONFIG_SOC_SERIES_GD32H7XX */
 	}
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_timer) */
 

@@ -16,6 +16,18 @@
 
 #include <gd32_exti.h>
 
+#if defined(CONFIG_SOC_SERIES_GD32H7XX)
+/*
+ * The GD32H7xx EXTI groups its line registers (22 lines per group, 0x18
+ * register stride). Only the group 0 lines (0..21) are handled; this covers
+ * all the GPIO capable lines (0..15).
+ */
+#define EXTI_INTEN EXTI_INTEN0
+#define EXTI_RTEN	EXTI_RTEN0
+#define EXTI_FTEN	EXTI_FTEN0
+#define EXTI_PD	EXTI_PD0
+#endif /* CONFIG_SOC_SERIES_GD32H7XX */
+
 /** Unsupported line indicator */
 #define EXTI_NOTSUP 0xFFU
 
