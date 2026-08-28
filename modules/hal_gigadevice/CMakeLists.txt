@@ -51,6 +51,17 @@ if(${CONFIG_SOC_SERIES_GD32A50X})
   zephyr_compile_definitions(GD32A50X)
 endif()
 
+# GD32H7xx series: the core domains are powered from the on-chip SMPS,
+# required for high PLL0 clock rates (e.g. 600MHz). SystemInit() applies the
+# configuration through pmu_smps_ldo_supply_config().
+if(${CONFIG_SOC_SERIES_GD32H7XX})
+  zephyr_compile_definitions(GD32H73X_75X)
+  # SystemInit() needs the SMPS power supply setup (pmu) and the vector
+  # table relocation (misc) helpers from the vendor library.
+  zephyr_library_sources(${gd32_std_src_dir}/${CONFIG_SOC_SERIES}_misc.c)
+  zephyr_library_sources(${gd32_std_src_dir}/${CONFIG_SOC_SERIES}_pmu.c)
+endif()
+
 # Global includes to be used outside hal_gigadevice
 zephyr_include_directories(${gd32_soc_sys_dir}/include)
 zephyr_include_directories(${gd32_std_dir}/include)
