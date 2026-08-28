@@ -84,6 +84,27 @@ static const uint32_t table_samp_time[] = {
 	SMP_TIME(144),
 	SMP_TIME(480)
 };
+#elif defined(CONFIG_SOC_SERIES_GD32H7XX)
+/*
+ * H7 encodes the sample time as a raw cycle count inside the RSQ entry
+ * (10-bit field), there is no separate sample-time register. The vendor
+ * lpdts header (pulled in through libopt.h) defines an unrelated
+ * SMP_TIME(regval) macro with the same name: drop it.
+ */
+#undef SMP_TIME
+#define SMP_TIME(x)	(x)
+
+static const uint16_t acq_time_tbl[8] = {3, 15, 28, 56, 84, 112, 144, 480};
+static const uint32_t table_samp_time[] = {
+	SMP_TIME(3),
+	SMP_TIME(15),
+	SMP_TIME(28),
+	SMP_TIME(56),
+	SMP_TIME(84),
+	SMP_TIME(112),
+	SMP_TIME(144),
+	SMP_TIME(480)
+};
 #elif defined(CONFIG_SOC_SERIES_GD32L23X)
 #define SMP_TIME(x)	ADC_SAMPLETIME_##x##POINT5
 
@@ -146,6 +167,9 @@ struct adc_gd32_data {
 	const struct device *dev;
 	uint16_t *buffer;
 	uint16_t *repeat_buffer;
+#ifdef CONFIG_SOC_SERIES_GD32H7XX
+	uint32_t samp_time;
+#endif
 };
 
 static void adc_gd32_isr(const struct device *dev)
@@ -203,10 +227,39 @@ static inline void adc_gd32_calibration(const struct adc_gd32_config *cfg)
 	}
 }
 
-static int adc_gd32_configure_sampt(const struct adc_gd32_config *cfg,
-				    uint8_t channel, uint16_t acq_time)
+static inline int adc_gd32_configure_sampt(const struct adc_gd32_config *cfg,
+					   struct adc_gd32_data *data,
+					   uint8_t channel, uint16_t acq_time)
 {
-	uint8_t index = 0, offset;
+	uint8_t index = 0;
+
+#ifdef CONFIG_SOC_SERIES_GD32H7XX
+	ARG_UNUSED(cfg);
+	ARG_UNUSED(channel);
+
+	if (acq_time != ADC_ACQ_TIME_DEFAULT) {
+		/* Acquisition time unit is adc clock cycle. */
+		if (ADC_ACQ_TIME_UNIT(acq_time) != ADC_ACQ_TIME_TICKS) {
+			return -EINVAL;
+		}
+
+		for ( ; index < ARRAY_SIZE(acq_time_tbl); index++) {
+			if (ADC_ACQ_TIME_VALUE(acq_time) <= acq_time_tbl[index]) {
+				break;
+			}
+		}
+
+		if (ADC_ACQ_TIME_VALUE(acq_time) != acq_time_tbl[index]) {
+			return -ENOTSUP;
+		}
+	}
+
+	/* The sample time is stored in the RSQ entry at read time. */
+	data->samp_time = table_samp_time[index];
+
+	return 0;
+#else
+	uint8_t offset;
 
 	if (acq_time != ADC_ACQ_TIME_DEFAULT) {
 		/* Acquisition time unit is adc clock cycle. */
@@ -236,12 +289,14 @@ static int adc_gd32_configure_sampt(const struct adc_gd32_config *cfg,
 	}
 
 	return 0;
+#endif
 }
 
 static int adc_gd32_channel_setup(const struct device *dev,
 				  const struct adc_channel_cfg *chan_cfg)
 {
 	const struct adc_gd32_config *cfg = dev->config;
+	struct adc_gd32_data *data = dev->data;
 
 	if (chan_cfg->gain != ADC_GAIN_1) {
 		LOG_ERR("Gain is not valid");
@@ -263,7 +318,7 @@ static int adc_gd32_channel_setup(const struct device *dev,
 		return -EINVAL;
 	}
 
-	return adc_gd32_configure_sampt(cfg, chan_cfg->channel_id,
+	return adc_gd32_configure_sampt(cfg, data, chan_cfg->channel_id,
 					chan_cfg->acquisition_time);
 }
 
@@ -300,7 +355,8 @@ static int adc_gd32_start_read(const struct device *dev,
 
 #if defined(CONFIG_SOC_SERIES_GD32F4XX) || \
 	defined(CONFIG_SOC_SERIES_GD32F3X0) || \
-	defined(CONFIG_SOC_SERIES_GD32L23X)
+	defined(CONFIG_SOC_SERIES_GD32L23X) || \
+	defined(CONFIG_SOC_SERIES_GD32H7XX)
 	ADC_CTL0(cfg->reg) &= ~ADC_CTL0_DRES;
 	ADC_CTL0(cfg->reg) |= CTL0_DRES(resolution_id);
 #elif defined(CONFIG_SOC_SERIES_GD32F403) || \
@@ -317,8 +373,13 @@ static int adc_gd32_start_read(const struct device *dev,
 	}
 
 	/* Single conversion mode with regular group. */
+#if defined(CONFIG_SOC_SERIES_GD32H7XX)
+	/* On H7 the RSQ entry carries its own sample time. */
+	ADC_RSQ2(cfg->reg) = index | SQX_SMP(data->samp_time);
+#else
 	ADC_RSQ2(cfg->reg) &= ~ADC_RSQX_RSQN;
 	ADC_RSQ2(cfg->reg) = index;
+#endif
 
 	data->buffer = sequence->buffer;
 
@@ -368,14 +429,22 @@ static int adc_gd32_init(const struct device *dev)
 {
 	struct adc_gd32_data *data = dev->data;
 	const struct adc_gd32_config *cfg = dev->config;
-	int ret;
 
 	data->dev = dev;
 
+#if !defined(CONFIG_SOC_SERIES_GD32H7XX)
+	int ret;
+
+	/*
+	 * H7 routes the ADC inputs to dedicated analog pads (_C pads): no
+	 * pin configuration exists or is needed, the devicetree node has no
+	 * pinctrl states.
+	 */
 	ret = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_DEFAULT);
 	if (ret < 0) {
 		return ret;
 	}
+#endif
 
 #ifdef CONFIG_SOC_SERIES_GD32F3X0
 	/* Select adc clock source and its prescaler. */
@@ -386,6 +455,16 @@ static int adc_gd32_init(const struct device *dev)
 			       (clock_control_subsys_t)&cfg->clkid);
 
 	(void)reset_line_toggle_dt(&cfg->reset);
+
+#if defined(CONFIG_SOC_SERIES_GD32H7XX)
+	/*
+	 * H7: clock the ADCs synchronously from HCLK/8 (37.5MHz at
+	 * 600MHz operation, within the 72MHz ADC0/1 limit). ADC1 shares
+	 * ADC0's clock configuration.
+	 */
+	ADC_SYNCCTL(cfg->reg) = (ADC_SYNCCTL(cfg->reg) & ~ADC_SYNCCTL_ADCSCK) |
+				(0xBU << 16);
+#endif
 
 #if defined(CONFIG_SOC_SERIES_GD32F403) || \
 	defined(CONFIG_SOC_SERIES_GD32VF103) || \

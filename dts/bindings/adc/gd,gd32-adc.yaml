@@ -47,10 +47,13 @@ properties:
     const: 1
 
   pinctrl-0:
-    required: true
+    required: false
+    description: >
+      Optional. Some series (e.g. GD32H7xx) route the ADC inputs to
+      dedicated analog pads which need no pin configuration.
 
   pinctrl-names:
-    required: true
+    required: false
 
 io-channel-cells:
   - input
