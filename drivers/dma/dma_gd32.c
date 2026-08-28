@@ -49,6 +49,20 @@
 #define DMA_CHMADDR(dma, ch) REG32((dma + 0x14UL) + 0x14UL * (uint32_t)(ch))
 #endif
 
+#ifdef CONFIG_SOC_SERIES_GD32H7XX
+/*
+ * The H7 DMA splits the per-channel flags between INTF0/INTF1 (and
+ * INTC0/INTC1) and names its error interrupts SDEIE/TAEIE. Only the
+ * ch >= DMA_CH8 fallback paths use the single-register accessors; the
+ * per-channel paths use DMA_INTC0/1 handled by the vendor macros.
+ */
+#define DMA_INTF(dma)	     REG32(dma + 0x00UL)
+#define DMA_INTC(dma)	     REG32(dma + 0x08UL)
+#define DMA_CHMADDR(dma, ch) DMA_CHM0ADDR((dma), (ch))
+#define DMA_CHXCTL_ERRIE     (DMA_CHXCTL_SDEIE | DMA_CHXCTL_TAEIE)
+#define DMA_FLAG_ERR	     (DMA_FLAG_SDE | DMA_FLAG_TAE)
+#endif
+
 #define GD32_DMA_INTF(dma)	  DMA_INTF(dma)
 #define GD32_DMA_INTC(dma)	  DMA_INTC(dma)
 #define GD32_DMA_CHCTL(dma, ch)	  DMA_CHCTL((dma), (ch))
