@@ -30,8 +30,18 @@ config ETH_GD32_RX_THREAD_PRIO
 config ETH_GD32_RX_DESC_NUM
 	int "Number of RX DMA descriptors"
 	default 8
-	range 2 64
+	range 2 8
 	depends on ETH_GD32
 	help
 	  Size of the RX descriptor ring.  Each descriptor owns a dedicated
-	  1536-byte buffer.
+	  1536-byte buffer.  The descriptors and buffers live in the
+	  peripheral SRAM0 region, which the ENET DMA requires.
+
+config ETH_GD32_SRAM0_BUDGET
+	int "SRAM0 budget for ENET descriptors and buffers (bytes)"
+	default 16384
+	depends on ETH_GD32
+	help
+	  Size of the peripheral SRAM0 region reserved for the ENET DMA
+	  descriptor ring and frame buffers.  The build fails if the
+	  configured ring does not fit.

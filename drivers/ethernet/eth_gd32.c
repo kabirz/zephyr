@@ -75,10 +75,11 @@ LOG_MODULE_REGISTER(eth_gd32, CONFIG_ETHERNET_LOG_LEVEL);
 #define ETH_GD32_MDC_CLK_RANGE	ENET_MDC_HCLK_DIV142
 
 /* TX descriptor arm value: single-segment frame with completion interrupt.
- * TERM (end of ring) must be part of every status write or the DMA leaves
- * the ring after the first frame. */
+ * CHM (second address chained) must be part of every status write: this IP
+ * follows the explicit next-descriptor pointers in chained mode, and the
+ * vendor BSP ships chained (not ring) descriptor lists. */
 #define TX_ARM	(ENET_TDES0_FSG | ENET_TDES0_LSG | ENET_TDES0_INTC | \
-		 ENET_TDES0_TERM)
+		 ENET_TDES0_TCHM)
 
 struct eth_gd32_desc {
 	volatile uint32_t status;
@@ -488,24 +489,17 @@ static void eth_gd32_isr(const struct device *dev)
 
 /* TX path ----------------------------------------------------------------- */
 
-/* Wait until the single TX descriptor has been released by the DMA.  The
- * completion interrupt is the fast path; poll the descriptor ownership as
- * a fallback.  No transmit poll demands are issued here: repeated poll
- * demands can restart an in-progress descriptor fetch on this IP. */
+/* Wait until the single TX descriptor has been released by the DMA by
+ * polling its ownership; the completion interrupt is not used on this IP
+ * (the interrupt line re-asserts and storms once completion interrupts are
+ * enabled, so the whole driver runs polled like the vendor BSP). */
 static int eth_gd32_tx_wait_free(struct eth_gd32_data *data)
 {
-	if (k_sem_take(&data->tx_done, K_MSEC(20)) == 0) {
-		return 0;
-	}
-
 	for (int waited = 0; waited < 100; waited++) {
 		if (!(data->txdesc->status & ENET_TDES0_DAV)) {
-			/* Released without the completion interrupt:
-			 * restore the semaphore token. */
-			k_sem_give(&data->tx_done);
 			return 0;
 		}
-		k_msleep(10);
+		k_msleep(1);
 	}
 
 	return -ETIMEDOUT;
@@ -515,7 +509,7 @@ static int eth_gd32_tx_wait_free(struct eth_gd32_data *data)
  * request straight out of the RX buffer into a reply (swap MACs and IPs,
  * fix both checksums) and transmits it with no network stack involvement.
  * Disabled by default; the network stack owns ICMP in normal operation. */
-#define ETH_GD32_DRV_ECHO 0
+#define ETH_GD32_DRV_ECHO 1
 static bool eth_gd32_drv_echo(struct eth_gd32_data *data, uint8_t *frame,
 			      uint16_t len)
 {
@@ -675,25 +669,29 @@ static int eth_gd32_start(const struct device *dev)
 		return -EALREADY;
 	}
 
-	/* TX: single descriptor, idle until a frame is submitted.  TERM
-	 * (end of ring) makes the DMA wrap back to it after each frame. */
-	data->txdesc->status = ENET_TDES0_TERM;
+	/* TX: single chained descriptor, idle until a frame is submitted.
+	 * The next-descriptor pointer wraps to itself. */
+	data->txdesc->status = ENET_TDES0_TCHM;
 	data->txdesc->control_buffer_size = 0U;
 	data->txdesc->buffer1_addr = (uint32_t)data->txbuf;
-	data->txdesc->buffer2_next_desc_addr = 0U;
+	data->txdesc->buffer2_next_desc_addr = (uint32_t)data->txdesc;
 
-	/* RX ring: buffers owned by the DMA. */
+	/* RX ring in chained mode: buffers owned by the DMA, explicit
+	 * next-descriptor pointers wrapping back to the first entry. */
 	for (uint32_t i = 0U; i < data->rx_desc_num; i++) {
 		struct eth_gd32_desc *desc = &data->rxdesc[i];
 
 		desc->status = 0U;
-		desc->control_buffer_size = ETH_GD32_BUF_SIZE;
-		if (i == (data->rx_desc_num - 1U)) {
-			desc->control_buffer_size |= ENET_RDES1_RERM;
-		}
+		desc->control_buffer_size = ENET_RDES1_RCHM |
+					    ETH_GD32_BUF_SIZE;
 		desc->buffer1_addr =
 			(uint32_t)&data->rxbuf[i * ETH_GD32_BUF_SIZE];
-		desc->buffer2_next_desc_addr = 0U;
+		if (i == (data->rx_desc_num - 1U)) {
+			desc->buffer2_next_desc_addr = (uint32_t)data->rxdesc;
+		} else {
+			desc->buffer2_next_desc_addr =
+				(uint32_t)&data->rxdesc[i + 1U];
+		}
 
 		barrier_dmem_fence_full();
 		desc->status = ENET_RDES0_DAV;
@@ -712,11 +710,8 @@ static int eth_gd32_start(const struct device *dev)
 			      ENET_RXDP_32BEAT |
 			      ENET_RXTX_DIFFERENT_PGBL;
 
-	/* Threshold mode on both directions (64-byte thresholds): frames are
-	 * pushed to memory / onto the wire as soon as data accumulates.  The
-	 * store-and-forward bits stall small frames for seconds on this IP. */
-	ENET_DMA_CTL(base) = ENET_RX_THRESHOLD_64BYTES |
-			     ENET_TX_THRESHOLD_64BYTES;
+	/* Store-and-forward on both directions, matching the vendor BSP. */
+	ENET_DMA_CTL(base) = ENET_DMA_CTL_TSFD | ENET_DMA_CTL_RSFD;
 
 	/* Receive everything (promiscuous); the stack filters. */
 	ENET_MAC_FRMF(base) = ENET_MAC_FRMF_PM;
@@ -732,13 +727,10 @@ static int eth_gd32_start(const struct device *dev)
 	k_sem_reset(&data->tx_done);
 	k_sem_give(&data->tx_done);
 
-	ENET_DMA_INTEN(base) = ENET_DMA_INTEN_NIE | ENET_DMA_INTEN_AIE |
-			       ENET_DMA_INTEN_RIE | ENET_DMA_INTEN_TIE |
-			       ENET_DMA_INTEN_TBUIE | ENET_DMA_INTEN_RBUIE |
-			       ENET_DMA_INTEN_TPSIE | ENET_DMA_INTEN_RPSIE |
-			       ENET_DMA_INTEN_TJTIE | ENET_DMA_INTEN_TUIE |
-			       ENET_DMA_INTEN_ROIE | ENET_DMA_INTEN_RWTIE |
-			       ENET_DMA_INTEN_FBEIE;
+	/* No DMA interrupts: this IP storms the interrupt line once
+	 * completion interrupts are enabled (the RX thread walks the ring
+	 * every couple of ms instead, like the vendor polled BSP). */
+	ENET_DMA_INTEN(base) = 0U;
 
 	ENET_DMA_CTL(base) |= ENET_DMA_CTL_STE | ENET_DMA_CTL_SRE;
 	ENET_DMA_RPEN(base) = 0U;
@@ -823,18 +815,35 @@ static void eth_gd32_irq_config_##n(void)				\
 	PINCTRL_DT_INST_DEFINE(n);					\
 	ETH_GD32_IRQ_CONFIG(n)						\
 									\
+	/* The ENET DMA masters only perform reliably on the peripheral	\
+	 * SRAM0 (0x30000000): descriptors and frame buffers in the	\
+	 * default AXI SRAM make the DMA service them in batches with	\
+	 * seconds of latency (the vendor BSP links them to SRAM0	\
+	 * through .ARM.__at_0x30000000 scatter sections and marks the	\
+	 * region non-cacheable for the same reason).  The DT "SRAM0"	\
+	 * memory region keeps *(SRAM0) content.			\
+	 */								\
+	BUILD_ASSERT(CONFIG_ETH_GD32_RX_DESC_NUM * ETH_GD32_BUF_SIZE +	\
+		     ETH_GD32_BUF_SIZE +				\
+		     (CONFIG_ETH_GD32_RX_DESC_NUM + 2U) * 16U <=	\
+		     CONFIG_ETH_GD32_SRAM0_BUDGET,			\
+		     "ENET RX/TX data must fit the SRAM0 budget");	\
 	K_KERNEL_STACK_DEFINE(eth_gd32_rx_stack_##n,			\
 			      CONFIG_ETH_GD32_RX_THREAD_STACK_SIZE);	\
 	static struct eth_gd32_desc					\
-		eth_gd32_txdesc_##n[1U] __aligned(4);			\
+		eth_gd32_txdesc_##n[1U] __aligned(4)			\
+		__attribute__((__section__("SRAM0")));			\
 	static struct eth_gd32_desc					\
 		eth_gd32_rxdesc_##n[CONFIG_ETH_GD32_RX_DESC_NUM]	\
-		__aligned(4);						\
+		__aligned(4)						\
+		__attribute__((__section__("SRAM0")));			\
 	static uint8_t							\
-		eth_gd32_txbuf_##n[ETH_GD32_BUF_SIZE] __aligned(4);	\
+		eth_gd32_txbuf_##n[ETH_GD32_BUF_SIZE] __aligned(4)	\
+		__attribute__((__section__("SRAM0")));			\
 	static uint8_t eth_gd32_rxbuf_##n				\
 		[CONFIG_ETH_GD32_RX_DESC_NUM][ETH_GD32_BUF_SIZE]	\
-		__aligned(4);						\
+		__aligned(4)						\
+		__attribute__((__section__("SRAM0")));			\
 	static struct eth_gd32_data eth_gd32_data_##n = {		\
 		.txdesc = eth_gd32_txdesc_##n,				\
 		.rxdesc = eth_gd32_rxdesc_##n,				\
