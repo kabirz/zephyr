@@ -19,6 +19,8 @@ if(CONFIG_ETH_STM32_HAL)
   zephyr_library_sources_ifdef(CONFIG_PTP_CLOCK_STM32_HAL eth_stm32_hal_ptp.c)
 endif()
 
+zephyr_library_sources_ifdef(CONFIG_ETH_GD32 eth_gd32.c)
+
 if(CONFIG_ETH_NATIVE_TAP)
   zephyr_library_sources(eth_native_tap.c)
   target_sources(native_simulator INTERFACE eth_native_tap_adapt.c)

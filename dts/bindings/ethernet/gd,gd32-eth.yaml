@@ -1,0 +1,42 @@
+# Copyright (c) 2026 GD32H7xx Zephyr bring-up
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  GigaDevice GD32 series Ethernet MAC (DesignWare-style MAC + DMA).
+
+  The MII/RMII PHY interface is selected through SYSCFG; the driver enables
+  RMII when an `rmii` property is present.  The driver manages the DMA
+  descriptor rings itself and drives the PHY over MDIO (PHY address
+  auto-detected at init unless the optional `phy-address` property is given).
+
+compatible: "gd,gd32-eth"
+
+include: [ethernet-controller.yaml, pinctrl-device.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  clocks:
+    required: true
+
+  rmii:
+    type: boolean
+    description: Use the RMII PHY interface instead of MII.
+
+  phy-address:
+    type: int
+    description: |
+      Fixed MDIO address of the PHY (0-31).  If omitted the driver scans
+      the bus for the first PHY responding with a valid ID.
+
+  phy-reset-gpios:
+    type: phandle-array
+    description: |
+      GPIO driving the PHY reset line (active low).  The driver keeps the
+      PHY in reset for a few milliseconds and releases it before the first
+      MDIO access, so the strap inputs are latched while the RMII reference
+      clock is already running.

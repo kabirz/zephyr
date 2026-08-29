@@ -448,5 +448,42 @@
 			resets = <&rctl GD32_RESET_UART7>;
 			status = "disabled";
 		};
+
+		/* ENET0/ENET1 are DesignWare-style MAC + DMA on AHB1.  The MII/RMII
+		 * PHY interface is selected in SYSCFG; TX/RX have separate RCU gates
+		 * in addition to the main peripheral gate. */
+		eth0: ethernet@40028000 {
+			compatible = "gd,gd32-eth";
+			reg = <0x40028000 0x1400>;
+			interrupts = <61 0>;
+			interrupt-names = "global";
+			clocks = <&cctl GD32_CLOCK_ENET0>,
+				 <&cctl GD32_CLOCK_ENET0TX>,
+				 <&cctl GD32_CLOCK_ENET0RX>,
+				 <&cctl GD32_CLOCK_SYSCFG>;
+			clock-names = "enet", "enet-tx", "enet-rx", "syscfg";
+			status = "disabled";
+		};
+
+		eth1: ethernet@4002a000 {
+			compatible = "gd,gd32-eth";
+			reg = <0x4002a000 0x1400>;
+			interrupts = <176 0>;
+			interrupt-names = "global";
+			clocks = <&cctl GD32_CLOCK_ENET1>,
+				 <&cctl GD32_CLOCK_ENET1TX>,
+				 <&cctl GD32_CLOCK_ENET1RX>,
+				 <&cctl GD32_CLOCK_SYSCFG>;
+			clock-names = "enet", "enet-tx", "enet-rx", "syscfg";
+			status = "disabled";
+		};
+
+		trng: rng@48021800 {
+			compatible = "gd,gd32-trng";
+			reg = <0x48021800 0x400>;
+			clocks = <&cctl GD32_CLOCK_TRNG>;
+			resets = <&rctl GD32_RESET_TRNG>;
+			status = "disabled";
+		};
 	};
 };

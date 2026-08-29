@@ -1,0 +1,37 @@
+# Copyright (c) 2026 GD32H7xx Zephyr bring-up
+# SPDX-License-Identifier: Apache-2.0
+
+config ETH_GD32
+	bool "GigaDevice GD32H7xx Ethernet driver"
+	default y
+	depends on DT_HAS_GD_GD32_ETH_ENABLED
+	depends on NET_L2_ETHERNET
+	select PINCTRL
+	help
+	  Enable the GigaDevice GD32H7xx Ethernet MAC driver (ENET0/ENET1).
+	  Supports MII and RMII PHY interfaces (selected in SYSCFG) with the
+	  PHY driven over MDIO; the PHY address is auto-detected unless the
+	  `phy-address` property is set in devicetree.
+
+config ETH_GD32_RX_THREAD_STACK_SIZE
+	int "RX thread stack size"
+	default 2048
+	depends on ETH_GD32
+	help
+	  Stack size of the RX processing thread.
+
+config ETH_GD32_RX_THREAD_PRIO
+	int "RX thread priority"
+	default 2
+	depends on ETH_GD32
+	help
+	  Priority of the RX processing thread.
+
+config ETH_GD32_RX_DESC_NUM
+	int "Number of RX DMA descriptors"
+	default 8
+	range 2 64
+	depends on ETH_GD32
+	help
+	  Size of the RX descriptor ring.  Each descriptor owns a dedicated
+	  1536-byte buffer.
