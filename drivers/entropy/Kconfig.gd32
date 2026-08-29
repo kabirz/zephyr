@@ -7,9 +7,23 @@ config ENTROPY_GD32_TRNG
 	bool "GigaDevice GD32F4xx TRNG driver"
 	default y
 	depends on DT_HAS_GD_GD32_TRNG_ENABLED
+	depends on !SOC_SERIES_GD32H7XX
 	select ENTROPY_HAS_DRIVER
 	select USE_GD32_TRNG
 	help
 	  Enable True Random Number Generator (TRNG) driver for GigaDevice
 	  GD32F4xx series. This driver uses the GD32 HAL and operates in
 	  polling mode.
+
+config ENTROPY_GD32_H7_TRNG
+	bool "GigaDevice GD32H7xx TRNG driver"
+	default y
+	depends on DT_HAS_GD_GD32_TRNG_ENABLED
+	depends on SOC_SERIES_GD32H7XX
+	select ENTROPY_HAS_DRIVER
+	select USE_GD32_TRNG
+	help
+	  Enable True Random Number Generator (TRNG) driver for GigaDevice
+	  GD32H7xx series. This driver uses the GD32 HAL and operates in
+	  polling mode.  The H7 TRNG sits on AHB2 and needs no 48MHz
+	  auxiliary clock.
