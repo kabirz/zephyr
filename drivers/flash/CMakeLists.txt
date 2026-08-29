@@ -169,6 +169,8 @@ if(CONFIG_SOC_FLASH_GD32)
 # zephyr-keep-sorted-stop
 endif()
 
+zephyr_library_sources_ifdef(CONFIG_FLASH_GD32_OSPI flash_gd32_ospi.c)
+
 zephyr_library_include_directories_ifdef(
   CONFIG_FLASH_MCUX_FLEXSPI_NOR
   ${ZEPHYR_BASE}/drivers/memc

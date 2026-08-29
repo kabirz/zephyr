@@ -1,0 +1,43 @@
+# Copyright (c) 2026 GD32H7xx Zephyr bring-up
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  GigaDevice GD32H7xx OSPI (OCTOSPI-style Quad/Octal SPI) controller in
+  indirect mode driving an external NOR flash.
+
+compatible: "gd,gd32-ospi"
+
+include: [base.yaml, reset-device.yaml, pinctrl-device.yaml]
+
+properties:
+  reg:
+    required: true
+
+  clocks:
+    required: true
+    description: |
+      Two clocks: the OSPI controller clock and the shared OSPIM
+      interconnect clock.
+
+  resets:
+    required: true
+
+  pinctrl-0:
+    required: true
+
+  pinctrl-names:
+    required: true
+
+  size:
+    type: int
+    required: true
+    description: |
+      Size of the attached NOR flash in bytes.
+
+  jedec-id:
+    type: uint8-array
+    required: true
+    description: |
+      Expected JEDEC manufacturer/device ID of the attached flash,
+      read with command 0x9F at driver init and logged for
+      verification.

@@ -39,3 +39,17 @@ config GD32_NV_FLASH_V4
 	depends on DT_HAS_GD_GD32_NV_FLASH_V4_ENABLED
 	help
 	  Enable the generic backend for GD32 FMC v4 flash driver.
+
+config FLASH_GD32_OSPI
+	bool "GigaDevice GD32H7xx OSPI NOR flash driver"
+	default y
+	depends on DT_HAS_GD_GD32_OSPI_ENABLED
+	select FLASH_HAS_DRIVER_ENABLED
+	select FLASH_HAS_PAGE_LAYOUT
+	select FLASH_HAS_EXPLICIT_ERASE
+	select PINCTRL
+	select USE_GD32_OSPI
+	help
+	  Enable the GD32H7xx OSPI (OCTOSPI-style) controller driver for an
+	  attached NOR flash, indirect mode with standard SPI (1-1-1)
+	  commands.

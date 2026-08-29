@@ -358,6 +358,25 @@
 			status = "disabled";
 		};
 
+		/* OSPI0/1 are OCTOSPI-style controllers on AHB3 (0x52005000-based);
+		 * the shared OSPIM interconnect routes SCK/CSN/IO signals to GPIO
+		 * ports and is clocked separately (GD32_CLOCK_OSPIM). */
+		ospi0: ospi@52005000 {
+			compatible = "gd,gd32-ospi";
+			reg = <0x52005000 0x1000>;
+			clocks = <&cctl GD32_CLOCK_OSPI0>, <&cctl GD32_CLOCK_OSPIM>;
+			resets = <&rctl GD32_RESET_OSPI0>;
+			status = "disabled";
+		};
+
+		ospi1: ospi@5200a000 {
+			compatible = "gd,gd32-ospi";
+			reg = <0x5200a000 0x1000>;
+			clocks = <&cctl GD32_CLOCK_OSPI1>, <&cctl GD32_CLOCK_OSPIM>;
+			resets = <&rctl GD32_RESET_OSPI1>;
+			status = "disabled";
+		};
+
 		usart0: usart@40011000 {
 			compatible = "gd,gd32-usart";
 			reg = <0x40011000 0x400>;

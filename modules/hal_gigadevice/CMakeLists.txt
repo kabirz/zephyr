@@ -91,6 +91,8 @@ zephyr_library_sources_ifdef(CONFIG_USE_GD32_I2C      ${gd32_std_src_dir}/${CONF
 zephyr_library_sources_ifdef(CONFIG_USE_GD32_IPA      ${gd32_std_src_dir}/${CONFIG_SOC_SERIES}_ipa.c)
 zephyr_library_sources_ifdef(CONFIG_USE_GD32_IREF     ${gd32_std_src_dir}/${CONFIG_SOC_SERIES}_iref.c)
 zephyr_library_sources_ifdef(CONFIG_USE_GD32_MISC     ${gd32_std_src_dir}/${CONFIG_SOC_SERIES}_misc.c)
+zephyr_library_sources_ifdef(CONFIG_USE_GD32_OSPI     ${gd32_std_src_dir}/${CONFIG_SOC_SERIES}_ospi.c
+                                                           ${gd32_std_src_dir}/${CONFIG_SOC_SERIES}_ospim.c)
 zephyr_library_sources_ifdef(CONFIG_USE_GD32_PMU      ${gd32_std_src_dir}/${CONFIG_SOC_SERIES}_pmu.c)
 zephyr_library_sources_ifdef(CONFIG_USE_GD32_RCU      ${gd32_std_src_dir}/${CONFIG_SOC_SERIES}_rcu.c)
 zephyr_library_sources_ifdef(CONFIG_USE_GD32_RTC      ${gd32_std_src_dir}/${CONFIG_SOC_SERIES}_rtc.c)
