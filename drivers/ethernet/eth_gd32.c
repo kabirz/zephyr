@@ -12,9 +12,11 @@
  * RX frames are handed to the network stack without the trailing FCS: the
  * MAC strips pad/FCS when ENET_MAC_CFG_APCD is set, and the descriptor
  * frame length then reflects the stripped length.  TX is serialized
- * through a single descriptor with a completion semaphore (the same model
- * as the STM32 HAL v1 driver); the RX path uses a descriptor ring fed by
- * the ENET interrupt through a dedicated thread.
+ * through a single descriptor whose release is waited on with a short
+ * microsecond spin followed by the interrupt-signalled completion
+ * semaphore (the same model as the STM32 HAL v1 driver); the RX path
+ * uses a descriptor ring fed by the ENET interrupt through a dedicated
+ * thread.
  */
 
 #define DT_DRV_COMPAT gd_gd32_eth
@@ -81,6 +83,20 @@ LOG_MODULE_REGISTER(eth_gd32, CONFIG_ETHERNET_LOG_LEVEL);
 #define TX_ARM	(ENET_TDES0_FSG | ENET_TDES0_LSG | ENET_TDES0_INTC | \
 		 ENET_TDES0_TCHM)
 
+/* DMA interrupt set: RX/TX completion (RS/TS) plus RX buffer unavailable
+ * (RBU), gated through both summary enables.  TBU is deliberately not
+ * enabled: with the single TX descriptor a poll demand issued from the
+ * ISR would re-assert TBU immediately and livelock the ISR (send()
+ * issues the poll itself instead). */
+#define ETH_GD32_DMA_INTEN						\
+	(ENET_DMA_INTEN_NIE | ENET_DMA_INTEN_AIE |			\
+	 ENET_DMA_INTEN_RIE | ENET_DMA_INTEN_RBUIE | ENET_DMA_INTEN_TIE)
+
+/* RX interrupt sources only: masked (NAPI-style) while the RX thread is
+ * draining the ring so a frame flood cannot re-enter the ISR per frame;
+ * TX completion stays enabled throughout. */
+#define ETH_GD32_DMA_INTEN_RX	(ENET_DMA_INTEN_RIE | ENET_DMA_INTEN_RBUIE)
+
 struct eth_gd32_desc {
 	volatile uint32_t status;
 	volatile uint32_t control_buffer_size;
@@ -112,6 +128,11 @@ struct eth_gd32_data {
 	volatile uint32_t dbg_rx_frames;
 	volatile uint32_t dbg_tx_done;
 	volatile uint32_t dbg_rbu;
+
+	/* consecutive RBU interrupts without any RX progress: the ISR
+	 * masks RBUIE once this trips, the RX thread re-arms it after
+	 * draining the ring. */
+	volatile uint32_t rbu_run;
 
 	struct k_mutex tx_lock;
 	struct k_sem tx_done;
@@ -233,7 +254,6 @@ static int eth_gd32_phy_scan(struct eth_gd32_data *data)
 
 static int eth_gd32_phy_init(const struct device *dev)
 {
-	struct eth_gd32_data *data = dev->data;
 	int ret;
 	uint16_t bmsr;
 	int timeout;
@@ -341,9 +361,6 @@ resched:
 
 /* RX path ---------------------------------------------------------------- */
 
-static bool eth_gd32_drv_echo(struct eth_gd32_data *data, uint8_t *frame,
-			      uint16_t len);
-
 static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 {
 	const struct device *dev = arg1;
@@ -354,7 +371,11 @@ static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 	ARG_UNUSED(arg3);
 
 	while (true) {
-		k_sem_take(&data->rx_sem, K_MSEC(2));
+		/* Event-driven: the DMA interrupt wakes this thread on every
+		 * received frame (and on RBU).  The timeout is only a
+		 * watchdog against a lost interrupt edge, not a polling
+		 * cadence. */
+		k_sem_take(&data->rx_sem, K_MSEC(10));
 
 		while (!(data->rxdesc[data->rx_idx].status &
 			 ENET_RDES0_DAV)) {
@@ -409,7 +430,6 @@ static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 				}
 			}
 
-release:
 			/* Give the descriptor back to the DMA. */
 			desc->status = 0U;
 			barrier_dmem_fence_full();
@@ -434,6 +454,21 @@ release:
 			ENET_DMA_STAT(base) = ENET_DMA_STAT_RBU;
 			ENET_DMA_RPEN(base) = 0U;
 		}
+
+		/* NAPI-style re-arm: the RX interrupt sources are masked
+		 * either while this drain was scheduled or by the RBU
+		 * backoff; the ring is empty now, so restore them.  A
+		 * frame that completed in between left RS set, and since
+		 * the interrupt line combines (status & enable), the
+		 * re-arm itself re-asserts it - no frame can be lost
+		 * here.  The 10ms watchdog above covers the case of this
+		 * IP's line logic deviating from that assumption. */
+		if (data->started &&
+		    (ENET_DMA_INTEN(base) & ETH_GD32_DMA_INTEN_RX) !=
+			    ETH_GD32_DMA_INTEN_RX) {
+			data->rbu_run = 0U;
+			ENET_DMA_INTEN(base) = ETH_GD32_DMA_INTEN;
+		}
 	}
 }
 
@@ -453,6 +488,12 @@ static void eth_gd32_isr(const struct device *dev)
 	}
 	if (stat & ENET_DMA_STAT_RS) {
 		clear |= ENET_DMA_STAT_RS;
+		data->rbu_run = 0U;
+		/* NAPI-style scheduling: leave the RX interrupt sources
+		 * masked for the whole drain; the RX thread re-arms them
+		 * once the ring is empty, so a frame flood costs one
+		 * interrupt per drain instead of one per frame. */
+		ENET_DMA_INTEN(base) &= ~ETH_GD32_DMA_INTEN_RX;
 		k_sem_give(&data->rx_sem);
 	}
 
@@ -465,7 +506,20 @@ static void eth_gd32_isr(const struct device *dev)
 		}
 		if (stat & ENET_DMA_STAT_RBU) {
 			clear |= ENET_DMA_STAT_RBU;
+			data->dbg_rbu++;
 			k_sem_give(&data->rx_sem);
+			/* While the RX ring is exhausted the RBU condition
+			 * re-asserts the moment it is cleared; after a run
+			 * of such interrupts with no received frame in
+			 * between, mask RBUIE so the line cannot livelock
+			 * the ISR.  The RX thread re-arms it once it has
+			 * returned the descriptors. */
+			if (++data->rbu_run >= 16U) {
+				data->rbu_run = 0U;
+				ENET_DMA_INTEN(base) &=
+					~ENET_DMA_INTEN_RBUIE;
+				ENET_DMA_STAT(base) = ENET_DMA_STAT_RBU;
+			}
 		}
 		clear |= stat & (ENET_DMA_STAT_TPS | ENET_DMA_STAT_TJT |
 				 ENET_DMA_STAT_RO | ENET_DMA_STAT_TU |
@@ -489,17 +543,26 @@ static void eth_gd32_isr(const struct device *dev)
 
 /* TX path ----------------------------------------------------------------- */
 
-/* Wait until the single TX descriptor has been released by the DMA by
- * polling its ownership; the completion interrupt is not used on this IP
- * (the interrupt line re-asserts and storms once completion interrupts are
- * enabled, so the whole driver runs polled like the vendor BSP). */
+/* Wait until the single TX descriptor has been released by the DMA.
+ * Completion normally takes no longer than the wire time of the previous
+ * frame (~123us for 1500 bytes at 100Mbps), so spin that off first; fall
+ * back to sleeping on the completion semaphore signalled by the TX
+ * interrupt (the spin keeps this correct even if that interrupt is
+ * masked or lost). */
 static int eth_gd32_tx_wait_free(struct eth_gd32_data *data)
 {
+	for (int i = 0; i < 25; i++) {
+		if (!(data->txdesc->status & ENET_TDES0_DAV)) {
+			return 0;
+		}
+		k_busy_wait(10U);
+	}
+
 	for (int waited = 0; waited < 100; waited++) {
 		if (!(data->txdesc->status & ENET_TDES0_DAV)) {
 			return 0;
 		}
-		k_msleep(1);
+		k_sem_take(&data->tx_done, K_MSEC(1));
 	}
 
 	return -ETIMEDOUT;
@@ -508,8 +571,10 @@ static int eth_gd32_tx_wait_free(struct eth_gd32_data *data)
 /* Temporary driver-level echo for latency debugging: converts an ICMP echo
  * request straight out of the RX buffer into a reply (swap MACs and IPs,
  * fix both checksums) and transmits it with no network stack involvement.
- * Disabled by default; the network stack owns ICMP in normal operation. */
-#define ETH_GD32_DRV_ECHO 1
+ * Disabled: it bypasses the network stack (net iface never sees the ping)
+ * and shares the single TX descriptor with the stack path. */
+#define ETH_GD32_DRV_ECHO 0
+#if defined(ETH_GD32_DRV_ECHO) && ETH_GD32_DRV_ECHO
 static bool eth_gd32_drv_echo(struct eth_gd32_data *data, uint8_t *frame,
 			      uint16_t len)
 {
@@ -608,6 +673,7 @@ static bool eth_gd32_drv_echo(struct eth_gd32_data *data, uint8_t *frame,
 
 	return true;
 }
+#endif /* ETH_GD32_DRV_ECHO */
 
 static int eth_gd32_send(const struct device *dev, struct net_pkt *pkt)
 {
@@ -727,13 +793,12 @@ static int eth_gd32_start(const struct device *dev)
 	k_sem_reset(&data->tx_done);
 	k_sem_give(&data->tx_done);
 
-	/* No DMA interrupts: this IP storms the interrupt line once
-	 * completion interrupts are enabled (the RX thread walks the ring
-	 * every couple of ms instead, like the vendor polled BSP). */
-	ENET_DMA_INTEN(base) = 0U;
-
+	/* Event-driven RX/TX: RS/TS completions and RBU wake the RX
+	 * thread and TX waiters through the ISR.  The RX thread keeps a
+	 * slow watchdog poll as a safety net. */
 	ENET_DMA_CTL(base) |= ENET_DMA_CTL_STE | ENET_DMA_CTL_SRE;
 	ENET_DMA_RPEN(base) = 0U;
+	ENET_DMA_INTEN(base) = ETH_GD32_DMA_INTEN;
 
 	data->started = true;
 	data->link_up = false;
