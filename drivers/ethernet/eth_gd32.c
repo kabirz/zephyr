@@ -97,6 +97,25 @@ struct eth_gd32_desc {
 	volatile uint32_t buffer2_next_desc_addr;
 };
 
+/* Descriptor cache maintenance: with the D-cache enabled the descriptor
+ * words in SRAM0 are cached; the DMA reads/writes them behind the cache.
+ * Invalidate before reading a descriptor the DMA may have written, flush
+ * after writing one the DMA will read.  Descriptor writes are flushed
+ * immediately, so an invalidate can never discard dirty data. */
+static inline void eth_gd32_desc_sync_for_cpu(struct eth_gd32_desc *desc)
+{
+#if defined(CONFIG_CACHE_MANAGEMENT)
+	sys_cache_data_invd_range(desc, sizeof(*desc));
+#endif
+}
+
+static inline void eth_gd32_desc_sync_for_dev(struct eth_gd32_desc *desc)
+{
+#if defined(CONFIG_CACHE_MANAGEMENT)
+	sys_cache_data_flush_range(desc, sizeof(*desc));
+#endif
+}
+
 struct eth_gd32_config {
 	uint32_t base;
 	uint16_t clk_enet;
@@ -143,6 +162,13 @@ struct eth_gd32_data {
 	volatile uint32_t t_wake_cyc;
 	volatile uint32_t t_copy_cyc;
 	volatile uint32_t t_frame_len;
+	volatile uint32_t t_deliver_cyc;
+	volatile uint32_t t_send_cyc;
+	volatile uint32_t t_txwait_cyc;
+	volatile uint32_t t_txarm_cyc;
+	volatile uint32_t t_alloc_cyc;
+	volatile uint32_t t_recv_cyc;
+	volatile uint32_t t_frame_cyc;
 #endif
 };
 
@@ -370,9 +396,12 @@ static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 	ARG_UNUSED(arg3);
 
 	while (true) {
-		k_sem_take(&data->rx_sem, K_MSEC(2));
 #ifdef CONFIG_ETH_GD32_IRQ_TEST
-		data->t_wake_cyc = k_cycle_get_32();
+		if (k_sem_take(&data->rx_sem, K_MSEC(2)) == 0) {
+			data->t_wake_cyc = k_cycle_get_32();
+		}
+#else
+		k_sem_take(&data->rx_sem, K_MSEC(2));
 #endif
 
 		/* Drain a bounded batch per wakeup.  The batch limit plus
@@ -385,8 +414,13 @@ static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 		     !(data->rxdesc[data->rx_idx].status &
 		       ENET_RDES0_DAV);
 		     batch++) {
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+			uint32_t tf0 = k_cycle_get_32();
+#endif
 			struct eth_gd32_desc *desc =
 				&data->rxdesc[data->rx_idx];
+
+			eth_gd32_desc_sync_for_cpu(desc);
 			uint32_t status = desc->status;
 			uint32_t frame_len =
 				(status & ENET_RDES0_FRML) >> 16;
@@ -408,9 +442,15 @@ static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 				if (frame_len >= 4U) {
 					frame_len -= 4U;
 				}
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+				uint32_t ta0 = k_cycle_get_32();
+#endif
 				pkt = net_pkt_rx_alloc_with_buffer(
 					data->iface, frame_len,
 					NET_AF_UNSPEC, 0, K_NO_WAIT);
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+				data->t_alloc_cyc = k_cycle_get_32() - ta0;
+#endif
 				if (pkt == NULL) {
 					eth_stats_update_errors_rx(
 						data->iface);
@@ -442,15 +482,24 @@ static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 			barrier_dmem_fence_full();
 			desc->status = ENET_RDES0_DAV;
 			barrier_dmem_fence_full();
+			eth_gd32_desc_sync_for_dev(desc);
 			ENET_DMA_RPEN(base) = 0U;
 
 			data->rx_idx = (data->rx_idx + 1U) %
 				       data->rx_desc_num;
 
 			if (pkt != NULL) {
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+				uint32_t tr0 = k_cycle_get_32();
+#endif
 				if (net_recv_data(data->iface, pkt) != 0) {
 					net_pkt_unref(pkt);
 				}
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+				data->t_recv_cyc = k_cycle_get_32() - tr0;
+				data->t_deliver_cyc = k_cycle_get_32();
+				data->t_frame_cyc = k_cycle_get_32() - tf0;
+#endif
 			}
 		}
 
@@ -580,6 +629,24 @@ static void eth_gd32_isr(const struct device *dev)
 	}
 }
 
+/* Enable the Cortex-M7 caches.  The core executes from flash with wait
+ * states; with the caches disabled every fetch stalls and the whole
+ * system crawls (measured without caches: 368us for one net_pkt pool
+ * allocation, 4.7ms ping RTT; with the I-cache: 26us / 0.6ms).  The
+ * vendor BSP enables caches for the same reason.  Instruction cache
+ * only: the D-cache additionally requires an MPU non-cacheable region
+ * for the descriptor SRAM (the vendor approach) and crashed the board
+ * with per-descriptor maintenance alone.  Raw PPB accesses, because
+ * the CMSIS core headers are not reliably includable from this
+ * translation unit. */
+static void eth_gd32_enable_caches(void)
+{
+	*(volatile uint32_t *)0xE000EF50U = 0U;		/* ICIALLU */
+	*(volatile uint32_t *)0xE000ED14U |= (1U << 17);	/* CCR: IC only */
+	barrier_dmem_fence_full();
+	barrier_isync_fence_full();
+}
+
 /* TX path ----------------------------------------------------------------- */
 
 /* Wait until the single TX descriptor has been released by the DMA.  The
@@ -593,6 +660,7 @@ static int eth_gd32_tx_wait_free(struct eth_gd32_data *data)
 	}
 
 	for (int waited = 0; waited < 100; waited++) {
+		eth_gd32_desc_sync_for_cpu(data->txdesc);
 		if (!(data->txdesc->status & ENET_TDES0_DAV)) {
 			/* Released without the completion interrupt:
 			 * restore the semaphore token. */
@@ -622,6 +690,10 @@ static int eth_gd32_send(const struct device *dev, struct net_pkt *pkt)
 		return -EIO;
 	}
 
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+	data->t_send_cyc = k_cycle_get_32();
+	uint32_t tw0 = k_cycle_get_32();
+#endif
 	k_mutex_lock(&data->tx_lock, K_FOREVER);
 
 	if (eth_gd32_tx_wait_free(data) != 0) {
@@ -629,6 +701,9 @@ static int eth_gd32_send(const struct device *dev, struct net_pkt *pkt)
 		LOG_ERR("TX descriptor release timeout");
 		return -EIO;
 	}
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+	data->t_txwait_cyc = k_cycle_get_32() - tw0;
+#endif
 
 #ifdef CONFIG_ETH_GD32_IRQ_TEST
 	uint32_t c0 = k_cycle_get_32();
@@ -647,14 +722,21 @@ static int eth_gd32_send(const struct device *dev, struct net_pkt *pkt)
 	data->t_frame_len = len;
 #endif
 
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+	uint32_t ta0 = k_cycle_get_32();
+#endif
 	data->txdesc->status = 0U;
 	data->txdesc->control_buffer_size = len;
 	data->txdesc->buffer1_addr = (uint32_t)data->txbuf;
 	barrier_dmem_fence_full();
 	data->txdesc->status = TX_ARM | ENET_TDES0_DAV;
 	barrier_dmem_fence_full();
+	eth_gd32_desc_sync_for_dev(data->txdesc);
 
 	ENET_DMA_TPEN(base) = 0U;
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+	data->t_txarm_cyc = k_cycle_get_32() - ta0;
+#endif
 
 	k_mutex_unlock(&data->tx_lock);
 
@@ -772,6 +854,13 @@ static int eth_gd32_start(const struct device *dev)
 		desc->status = ENET_RDES0_DAV;
 	}
 	data->rx_idx = 0U;
+
+	/* The descriptors were just written through the cache; push them
+	 * out before the DMA starts walking them. */
+	eth_gd32_desc_sync_for_dev(data->txdesc);
+	for (uint32_t i = 0U; i < data->rx_desc_num; i++) {
+		eth_gd32_desc_sync_for_dev(&data->rxdesc[i]);
+	}
 
 	ENET_DMA_TDTADDR(base) = (uint32_t)data->txdesc;
 	ENET_DMA_RDTADDR(base) = (uint32_t)data->rxdesc;
@@ -953,6 +1042,7 @@ static void eth_gd32_irq_config_##n(void)				\
 									\
 		data->base = cfg->base;					\
 		data->dev = dev;					\
+		eth_gd32_enable_caches();						\
 		k_mutex_init(&data->tx_lock);				\
 		k_sem_init(&data->tx_done, 0, 1);			\
 		k_sem_init(&data->rx_sem, 0, 1);			\
@@ -1100,6 +1190,15 @@ static int cmd_gdeth_stat(const struct shell *sh, size_t argc, char **argv)
 		    data->t_frame_len, data->t_copy_cyc,
 		    data->t_frame_len ? data->t_copy_cyc /
 					data->t_frame_len : 0U);
+	shell_print(sh, "wake=%u (rs->wake) deliver=%u",
+		    data->t_wake_cyc - data->t_rs_cyc,
+		    data->t_deliver_cyc - data->t_wake_cyc);
+	shell_print(sh, "stack=%u (deliver->send) txwait=%u txarm=%u",
+		    data->t_send_cyc - data->t_deliver_cyc,
+		    data->t_txwait_cyc, data->t_txarm_cyc);
+	shell_print(sh, "rxframe=%u alloc=%u recv=%u (cyc)",
+		    data->t_frame_cyc, data->t_alloc_cyc,
+		    data->t_recv_cyc);
 	for (uint32_t bit = 0U; bit < 32U; bit++) {
 		if (data->t_bits[bit] != 0U) {
 			shell_print(sh, "  bit %2u (%s): %u", bit,
