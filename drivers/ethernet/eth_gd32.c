@@ -12,11 +12,9 @@
  * RX frames are handed to the network stack without the trailing FCS: the
  * MAC strips pad/FCS when ENET_MAC_CFG_APCD is set, and the descriptor
  * frame length then reflects the stripped length.  TX is serialized
- * through a single descriptor whose release is waited on with a short
- * microsecond spin followed by the interrupt-signalled completion
- * semaphore (the same model as the STM32 HAL v1 driver); the RX path
- * uses a descriptor ring fed by the ENET interrupt through a dedicated
- * thread.
+ * through a single descriptor with a completion semaphore (the same model
+ * as the STM32 HAL v1 driver); the RX path uses a descriptor ring fed by
+ * the ENET interrupt through a dedicated thread.
  */
 
 #define DT_DRV_COMPAT gd_gd32_eth
@@ -32,6 +30,7 @@
 #include <zephyr/net/net_pkt.h>
 #include <zephyr/random/random.h>
 #include <zephyr/sys/barrier.h>
+#include <zephyr/cache.h>
 #include <ethernet/eth_stats.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/irq.h>
@@ -83,19 +82,13 @@ LOG_MODULE_REGISTER(eth_gd32, CONFIG_ETHERNET_LOG_LEVEL);
 #define TX_ARM	(ENET_TDES0_FSG | ENET_TDES0_LSG | ENET_TDES0_INTC | \
 		 ENET_TDES0_TCHM)
 
-/* DMA interrupt set: RX/TX completion (RS/TS) plus RX buffer unavailable
- * (RBU), gated through both summary enables.  TBU is deliberately not
- * enabled: with the single TX descriptor a poll demand issued from the
- * ISR would re-assert TBU immediately and livelock the ISR (send()
- * issues the poll itself instead). */
-#define ETH_GD32_DMA_INTEN						\
-	(ENET_DMA_INTEN_NIE | ENET_DMA_INTEN_AIE |			\
-	 ENET_DMA_INTEN_RIE | ENET_DMA_INTEN_RBUIE | ENET_DMA_INTEN_TIE)
-
-/* RX interrupt sources only: masked (NAPI-style) while the RX thread is
- * draining the ring so a frame flood cannot re-enter the ISR per frame;
- * TX completion stays enabled throughout. */
+/* RX interrupt sources, masked NAPI-style for the whole ring drain and
+ * re-armed by the RX thread once the ring is empty. */
 #define ETH_GD32_DMA_INTEN_RX	(ENET_DMA_INTEN_RIE | ENET_DMA_INTEN_RBUIE)
+
+/* Consecutive RBU interrupts tolerated before RBUIE is masked as a
+ * backoff (reset on every successful receive). */
+#define ETH_GD32_RBU_RUN_MAX	16U
 
 struct eth_gd32_desc {
 	volatile uint32_t status;
@@ -125,14 +118,12 @@ struct eth_gd32_data {
 	bool started;
 
 	/* volatile probe counters for bring-up debugging */
-	volatile uint32_t dbg_rx_frames;
-	volatile uint32_t dbg_tx_done;
-	volatile uint32_t dbg_rbu;
-
-	/* consecutive RBU interrupts without any RX progress: the ISR
-	 * masks RBUIE once this trips, the RX thread re-arms it after
-	 * draining the ring. */
-	volatile uint32_t rbu_run;
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+	volatile uint32_t t_entries;
+	volatile uint32_t t_bits[32];
+	volatile uint32_t t_residual;
+	volatile uint32_t t_last_stat;
+#endif
 
 	struct k_mutex tx_lock;
 	struct k_sem tx_done;
@@ -146,6 +137,13 @@ struct eth_gd32_data {
 	uint8_t *rxbuf;
 	uint32_t rx_idx;
 	uint32_t rx_desc_num;
+	volatile uint32_t rbu_run;
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+	volatile uint32_t t_rs_cyc;
+	volatile uint32_t t_wake_cyc;
+	volatile uint32_t t_copy_cyc;
+	volatile uint32_t t_frame_len;
+#endif
 };
 
 /* MII access ------------------------------------------------------------- */
@@ -254,6 +252,7 @@ static int eth_gd32_phy_scan(struct eth_gd32_data *data)
 
 static int eth_gd32_phy_init(const struct device *dev)
 {
+	struct eth_gd32_data *data = dev->data;
 	int ret;
 	uint16_t bmsr;
 	int timeout;
@@ -371,14 +370,21 @@ static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 	ARG_UNUSED(arg3);
 
 	while (true) {
-		/* Event-driven: the DMA interrupt wakes this thread on every
-		 * received frame (and on RBU).  The timeout is only a
-		 * watchdog against a lost interrupt edge, not a polling
-		 * cadence. */
-		k_sem_take(&data->rx_sem, K_MSEC(10));
+		k_sem_take(&data->rx_sem, K_MSEC(2));
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+		data->t_wake_cyc = k_cycle_get_32();
+#endif
 
-		while (!(data->rxdesc[data->rx_idx].status &
-			 ENET_RDES0_DAV)) {
+		/* Drain a bounded batch per wakeup.  The batch limit plus
+		 * the blocking semaphore wait keep the IP stack (lower
+		 * thread priority) running: an unbounded drain loop would
+		 * starve it, and k_yield() would not help - it only hands
+		 * the CPU to threads of the SAME priority. */
+		for (uint32_t batch = 0U;
+		     batch < CONFIG_ETH_GD32_RX_BATCH &&
+		     !(data->rxdesc[data->rx_idx].status &
+		       ENET_RDES0_DAV);
+		     batch++) {
 			struct eth_gd32_desc *desc =
 				&data->rxdesc[data->rx_idx];
 			uint32_t status = desc->status;
@@ -402,13 +408,6 @@ static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 				if (frame_len >= 4U) {
 					frame_len -= 4U;
 				}
-#if defined(ETH_GD32_DRV_ECHO) && ETH_GD32_DRV_ECHO
-				if (eth_gd32_drv_echo(data, rxptr,
-						      frame_len)) {
-					pkt = NULL;
-					goto release;
-				}
-#endif
 				pkt = net_pkt_rx_alloc_with_buffer(
 					data->iface, frame_len,
 					NET_AF_UNSPEC, 0, K_NO_WAIT);
@@ -416,6 +415,9 @@ static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 					eth_stats_update_errors_rx(
 						data->iface);
 				} else {
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+					uint32_t c0 = k_cycle_get_32();
+#endif
 #if defined(CONFIG_CACHE_MANAGEMENT)
 					sys_cache_data_invd_range(rxptr,
 						frame_len);
@@ -427,6 +429,11 @@ static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 						eth_stats_update_errors_rx(
 							data->iface);
 					}
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+					data->t_copy_cyc =
+						k_cycle_get_32() - c0;
+					data->t_frame_len = frame_len;
+#endif
 				}
 			}
 
@@ -441,7 +448,6 @@ static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 				       data->rx_desc_num;
 
 			if (pkt != NULL) {
-				data->dbg_rx_frames++;
 				if (net_recv_data(data->iface, pkt) != 0) {
 					net_pkt_unref(pkt);
 				}
@@ -455,24 +461,19 @@ static void eth_gd32_rx_thread(void *arg1, void *arg2, void *arg3)
 			ENET_DMA_RPEN(base) = 0U;
 		}
 
-		/* NAPI-style re-arm: the RX interrupt sources are masked
-		 * either while this drain was scheduled or by the RBU
-		 * backoff; the ring is empty now, so restore them.  A
-		 * frame that completed in between left RS set, and since
-		 * the interrupt line combines (status & enable), the
-		 * re-arm itself re-asserts it - no frame can be lost
-		 * here.  The 10ms watchdog above covers the case of this
-		 * IP's line logic deviating from that assumption. */
+		/* Re-arm RBUIE if the RBU backoff masked it: the ring has
+		 * been drained now, so the RBU condition is gone. */
 		if (data->started &&
-		    (ENET_DMA_INTEN(base) & ETH_GD32_DMA_INTEN_RX) !=
-			    ETH_GD32_DMA_INTEN_RX) {
+		    (ENET_DMA_INTEN(base) & ENET_DMA_INTEN_RBUIE) == 0U) {
 			data->rbu_run = 0U;
-			ENET_DMA_INTEN(base) = ETH_GD32_DMA_INTEN;
+			ENET_DMA_INTEN(base) |= ENET_DMA_INTEN_RBUIE;
 		}
 	}
 }
 
 /* Interrupt handling ------------------------------------------------------ */
+
+static void eth_gd32_mac_flags_clear(uint32_t base);
 
 static void eth_gd32_isr(const struct device *dev)
 {
@@ -480,47 +481,66 @@ static void eth_gd32_isr(const struct device *dev)
 	uint32_t base = data->base;
 	uint32_t stat = ENET_DMA_STAT(base);
 	uint32_t clear = 0U;
+	uint32_t rest;
+
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+	data->t_entries++;
+	data->t_last_stat = stat;
+	for (uint32_t bit = 0U; bit < 32U; bit++) {
+		if (stat & BIT(bit)) {
+			data->t_bits[bit]++;
+		}
+	}
+#endif
+	/* The interrupt line asserts whenever any status bit with its INTEN
+	 * enable set is pending - the normal/abnormal summary bits are
+	 * conveniences, not gates.  Every asserted source must be cleared
+	 * here or the ISR re-enters immediately: the historic "interrupt
+	 * storm" was the TBU bit surviving the ISR (it was only cleared in
+	 * the abnormal-summary branch, which it never takes).  With a
+	 * single-descriptor TX list the DMA reports TBU after every
+	 * transmitted frame - a normal event on this IP. */
 
 	if (stat & ENET_DMA_STAT_TS) {
 		clear |= ENET_DMA_STAT_TS;
-		data->dbg_tx_done++;
 		k_sem_give(&data->tx_done);
 	}
 	if (stat & ENET_DMA_STAT_RS) {
 		clear |= ENET_DMA_STAT_RS;
 		data->rbu_run = 0U;
-		/* NAPI-style scheduling: leave the RX interrupt sources
-		 * masked for the whole drain; the RX thread re-arms them
-		 * once the ring is empty, so a frame flood costs one
-		 * interrupt per drain instead of one per frame. */
-		ENET_DMA_INTEN(base) &= ~ETH_GD32_DMA_INTEN_RX;
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+		data->t_rs_cyc = k_cycle_get_32();
+#endif
 		k_sem_give(&data->rx_sem);
 	}
+	if (stat & ENET_DMA_STAT_TBU) {
+		/* Normal with an idle TX list; send() issues the next transmit
+		 * poll demand itself (a poll demand here would re-assert TBU
+		 * right away). */
+		clear |= ENET_DMA_STAT_TBU;
+	}
+	if (stat & ENET_DMA_STAT_RBU) {
+		/* The RX ring drained while the thread was busy; wake it so it
+		 * returns the descriptors and reception resumes.  While the
+		 * ring stays exhausted the RBU condition re-asserts the
+		 * moment it is cleared; after a run of such interrupts with
+		 * no received frame in between, mask RBUIE so the line can
+		 * not livelock the ISR.  The RX thread re-arms it after the
+		 * next drain. */
+		clear |= ENET_DMA_STAT_RBU;
+		k_sem_give(&data->rx_sem);
+		if (++data->rbu_run >= ETH_GD32_RBU_RUN_MAX) {
+			data->rbu_run = 0U;
+			ENET_DMA_INTEN(base) &= ~ENET_DMA_INTEN_RBUIE;
+			ENET_DMA_STAT(base) = ENET_DMA_STAT_RBU;
+		}
+	}
 
-	if (stat & ENET_DMA_STAT_AI) {
-		if (stat & ENET_DMA_STAT_TBU) {
-			clear |= ENET_DMA_STAT_TBU;
-			/* No poll demand here: with an empty TX list the
-			 * poll would re-assert TBU right away and livelock
-			 * the ISR.  send() issues the poll itself. */
-		}
-		if (stat & ENET_DMA_STAT_RBU) {
-			clear |= ENET_DMA_STAT_RBU;
-			data->dbg_rbu++;
-			k_sem_give(&data->rx_sem);
-			/* While the RX ring is exhausted the RBU condition
-			 * re-asserts the moment it is cleared; after a run
-			 * of such interrupts with no received frame in
-			 * between, mask RBUIE so the line cannot livelock
-			 * the ISR.  The RX thread re-arms it once it has
-			 * returned the descriptors. */
-			if (++data->rbu_run >= 16U) {
-				data->rbu_run = 0U;
-				ENET_DMA_INTEN(base) &=
-					~ENET_DMA_INTEN_RBUIE;
-				ENET_DMA_STAT(base) = ENET_DMA_STAT_RBU;
-			}
-		}
+	if (stat & (ENET_DMA_STAT_TPS | ENET_DMA_STAT_TJT |
+			    ENET_DMA_STAT_RO | ENET_DMA_STAT_TU |
+			    ENET_DMA_STAT_RPS | ENET_DMA_STAT_RWT |
+			    ENET_DMA_STAT_ER | ENET_DMA_STAT_ET |
+			    ENET_DMA_STAT_FBE)) {
 		clear |= stat & (ENET_DMA_STAT_TPS | ENET_DMA_STAT_TJT |
 				 ENET_DMA_STAT_RO | ENET_DMA_STAT_TU |
 				 ENET_DMA_STAT_RPS | ENET_DMA_STAT_RWT |
@@ -532,148 +552,58 @@ static void eth_gd32_isr(const struct device *dev)
 		}
 	}
 
+	if (stat & (ENET_DMA_STAT_MSC | ENET_DMA_STAT_WUM |
+		    ENET_DMA_STAT_TST)) {
+		/* Mirrors of MAC-level events (the MSC statistics sources are
+		 * individually maskable and their flags need single-bit
+		 * write-1-to-clear accesses; the mirrors follow the flags). */
+		eth_gd32_mac_flags_clear(base);
+		rest = stat & (ENET_DMA_STAT_MSC | ENET_DMA_STAT_WUM |
+			       ENET_DMA_STAT_TST);
+		while (rest) {
+			uint32_t bit = rest & ~(rest - 1U);
+
+			ENET_DMA_STAT(base) = bit;
+			rest &= ~bit;
+		}
+	}
+
 	if (stat & (ENET_DMA_STAT_NI | ENET_DMA_STAT_AI)) {
 		clear |= stat & (ENET_DMA_STAT_NI | ENET_DMA_STAT_AI);
 	}
 
 	if (clear != 0U) {
 		ENET_DMA_STAT(base) = clear;
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+		data->t_residual |= ENET_DMA_STAT(base) & clear;
+#endif
 	}
 }
 
 /* TX path ----------------------------------------------------------------- */
 
-/* Wait until the single TX descriptor has been released by the DMA.
- * Completion normally takes no longer than the wire time of the previous
- * frame (~123us for 1500 bytes at 100Mbps), so spin that off first; fall
- * back to sleeping on the completion semaphore signalled by the TX
- * interrupt (the spin keeps this correct even if that interrupt is
- * masked or lost). */
+/* Wait until the single TX descriptor has been released by the DMA.  The
+ * completion interrupt is the fast path; poll the descriptor ownership as
+ * a fallback.  No transmit poll demands are issued here: repeated poll
+ * demands can restart an in-progress descriptor fetch on this IP. */
 static int eth_gd32_tx_wait_free(struct eth_gd32_data *data)
 {
-	for (int i = 0; i < 25; i++) {
-		if (!(data->txdesc->status & ENET_TDES0_DAV)) {
-			return 0;
-		}
-		k_busy_wait(10U);
+	if (k_sem_take(&data->tx_done, K_MSEC(20)) == 0) {
+		return 0;
 	}
 
 	for (int waited = 0; waited < 100; waited++) {
 		if (!(data->txdesc->status & ENET_TDES0_DAV)) {
+			/* Released without the completion interrupt:
+			 * restore the semaphore token. */
+			k_sem_give(&data->tx_done);
 			return 0;
 		}
-		k_sem_take(&data->tx_done, K_MSEC(1));
+		k_msleep(10);
 	}
 
 	return -ETIMEDOUT;
 }
-
-/* Temporary driver-level echo for latency debugging: converts an ICMP echo
- * request straight out of the RX buffer into a reply (swap MACs and IPs,
- * fix both checksums) and transmits it with no network stack involvement.
- * Disabled: it bypasses the network stack (net iface never sees the ping)
- * and shares the single TX descriptor with the stack path. */
-#define ETH_GD32_DRV_ECHO 0
-#if defined(ETH_GD32_DRV_ECHO) && ETH_GD32_DRV_ECHO
-static bool eth_gd32_drv_echo(struct eth_gd32_data *data, uint8_t *frame,
-			      uint16_t len)
-{
-	uint16_t ethertype, iplen, icmplen, sum16;
-	uint32_t sum;
-	uint8_t *ip, *icmp;
-	uint8_t i;
-
-	if (len < 42U) {
-		return false;
-	}
-
-	ethertype = ((uint16_t)frame[12] << 8) | frame[13];
-	if (ethertype != 0x0800U) {
-		return false;
-	}
-
-	ip = frame + 14U;
-	if (((ip[0] >> 4) != 4U) || ((ip[0] & 0xFU) < 5U) || (ip[9] != 1U)) {
-		return false;
-	}
-
-	iplen = ((uint16_t)ip[2] << 8) | ip[3];
-	if (iplen < 20U || (14U + iplen) > len) {
-		return false;
-	}
-
-	icmp = ip + ((uint16_t)(ip[0] & 0xFU) << 2);
-	if (icmp[0] != 8U) {
-		return false;
-	}
-
-	icmplen = iplen - ((uint16_t)(ip[0] & 0xFU) << 2);
-	icmp[0] = 0U;
-	icmp[2] = 0U;
-	icmp[3] = 0U;
-	sum = 0U;
-	for (uint16_t j = 0U; j < icmplen; j += 2U) {
-		sum += ((uint16_t)icmp[j] << 8) |
-		       (j + 1U < icmplen ? icmp[j + 1] : 0U);
-	}
-	while (sum >> 16) {
-		sum = (sum & 0xFFFFU) + (sum >> 16);
-	}
-	sum16 = ~((uint16_t)sum);
-	icmp[2] = (uint8_t)(sum16 >> 8);
-	icmp[3] = (uint8_t)sum16;
-
-	/* swap source and destination IP addresses, rebuild the header
-	 * checksum */
-	for (i = 0U; i < 4U; i++) {
-		uint8_t tmp = ip[12U + i];
-
-		ip[12U + i] = ip[16U + i];
-		ip[16U + i] = tmp;
-	}
-	ip[10] = 0U;
-	ip[11] = 0U;
-	sum = 0U;
-	for (i = 0U; i < 20U; i += 2U) {
-		sum += ((uint16_t)ip[i] << 8) | ip[i + 1U];
-	}
-	while (sum >> 16) {
-		sum = (sum & 0xFFFFU) + (sum >> 16);
-	}
-	sum16 = ~((uint16_t)sum);
-	ip[10] = (uint8_t)(sum16 >> 8);
-	ip[11] = (uint8_t)sum16;
-
-	/* swap source and destination MACs */
-	for (i = 0U; i < 6U; i++) {
-		uint8_t tmp = frame[i];
-
-		frame[i] = frame[i + 6U];
-		frame[i + 6U] = tmp;
-	}
-
-	/* raw transmit, same descriptor discipline as eth_gd32_send() */
-	k_mutex_lock(&data->tx_lock, K_FOREVER);
-	if (eth_gd32_tx_wait_free(data) != 0) {
-		k_mutex_unlock(&data->tx_lock);
-		return true;
-	}
-	memcpy(data->txbuf, frame, len);
-#if defined(CONFIG_CACHE_MANAGEMENT)
-	sys_cache_data_flush_range(data->txbuf, len);
-#endif
-	data->txdesc->status = 0U;
-	data->txdesc->control_buffer_size = len;
-	data->txdesc->buffer1_addr = (uint32_t)data->txbuf;
-	barrier_dmem_fence_full();
-	data->txdesc->status = TX_ARM | ENET_TDES0_DAV;
-	barrier_dmem_fence_full();
-	ENET_DMA_TPEN(data->base) = 0U;
-	k_mutex_unlock(&data->tx_lock);
-
-	return true;
-}
-#endif /* ETH_GD32_DRV_ECHO */
 
 static int eth_gd32_send(const struct device *dev, struct net_pkt *pkt)
 {
@@ -700,6 +630,9 @@ static int eth_gd32_send(const struct device *dev, struct net_pkt *pkt)
 		return -EIO;
 	}
 
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+	uint32_t c0 = k_cycle_get_32();
+#endif
 	ret = net_pkt_read(pkt, data->txbuf, len);
 	if (ret != 0) {
 		k_mutex_unlock(&data->tx_lock);
@@ -708,6 +641,10 @@ static int eth_gd32_send(const struct device *dev, struct net_pkt *pkt)
 
 #if defined(CONFIG_CACHE_MANAGEMENT)
 	sys_cache_data_flush_range(data->txbuf, len);
+#endif
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+	data->t_copy_cyc = k_cycle_get_32() - c0;
+	data->t_frame_len = len;
 #endif
 
 	data->txdesc->status = 0U;
@@ -725,6 +662,78 @@ static int eth_gd32_send(const struct device *dev, struct net_pkt *pkt)
 }
 
 /* Start/stop -------------------------------------------------------------- */
+
+/* MSC (MAC statistics) flag and mask bits.  The MSC interrupt sources are
+ * enabled out of reset: every received unicast frame (and a few error
+ * classes) latches a flag in MSC_RINTF / MSC_TINTF, which summarizes into
+ * MAC_INTF.MSC and mirrors into DMA_STAT bit 27.  That mirror follows the
+ * source flags instead of being plain W1C status, so an unhandled MSC flag
+ * holds the ENET interrupt line asserted forever - observed as an ISR
+ * livelock starving the whole system once any DMA interrupt was enabled.
+ *
+ * On this IP the MSC/MAC flag registers do not accept multi-bit write-1-
+ * to-clear accesses (the vendor library also clears them one bit at a
+ * time), so every clear below is a single-bit write.  The MSC sources are
+ * additionally masked so the flags never latch in the first place. */
+
+#define MSC_RX_INT_FLAGS	(ENET_MSC_RINTF_RFCE | ENET_MSC_RINTF_RFAE | \
+				 ENET_MSC_RINTF_RGUF)
+#define MSC_TX_INT_FLAGS	(ENET_MSC_TINTF_TGFSC | ENET_MSC_TINTF_TGFMSC | \
+				 ENET_MSC_TINTF_TGF)
+#define MAC_INT_FLAGS		(ENET_MAC_INTF_WUM | ENET_MAC_INTF_MSC | \
+				 ENET_MAC_INTF_MSCR | ENET_MAC_INTF_MSCT | \
+				 ENET_MAC_INTF_TMST)
+
+/* Clear the latched MAC-level interrupt flags, one bit per write. */
+static void eth_gd32_mac_flags_clear(uint32_t base)
+{
+	uint32_t rest = ENET_MAC_INTF(base) & MAC_INT_FLAGS;
+
+	/* The MSC summary mirrors the per-source flags; kill the sources
+	 * first so the summary can not re-latch mid-clear. */
+	ENET_MSC_RINTF(base) = ENET_MSC_RINTF_RFCE;
+	ENET_MSC_RINTF(base) = ENET_MSC_RINTF_RFAE;
+	ENET_MSC_RINTF(base) = ENET_MSC_RINTF_RGUF;
+	ENET_MSC_TINTF(base) = ENET_MSC_TINTF_TGFSC;
+	ENET_MSC_TINTF(base) = ENET_MSC_TINTF_TGFMSC;
+	ENET_MSC_TINTF(base) = ENET_MSC_TINTF_TGF;
+
+	while (rest) {
+		uint32_t bit = rest & ~(rest - 1U);
+
+		ENET_MAC_INTF(base) = bit;
+		rest &= ~bit;
+	}
+}
+
+/* Mask every MAC-level interrupt source and drop the latched flags, so
+ * only the DMA descriptor-completion bits in DMA_STAT remain as interrupt
+ * sources (those behave like ordinary W1C bits). */
+static void eth_gd32_irq_srcs_quiesce(uint32_t base)
+{
+	uint32_t rest;
+
+	/* Mask the MSC interrupt sources (1 = masked) and the MAC wakeup /
+	 * timestamp sources.  Read-modify-write: a plain write replaces the
+	 * whole register, it does not accumulate. */
+	ENET_MSC_RINTMSK(base) |= MSC_RX_INT_FLAGS;
+	ENET_MSC_TINTMSK(base) |= MSC_TX_INT_FLAGS;
+	ENET_MAC_INTMSK(base) |= ENET_MAC_INTMSK_WUMIM |
+				 ENET_MAC_INTMSK_TMSTIM;
+
+	eth_gd32_mac_flags_clear(base);
+
+	/* Clear any DMA status left over from before the software reset;
+	 * only the defined event bits (0..10, 13..16), multi-bit W1C is
+	 * fine for this register. */
+	rest = 0x1E7FFU;
+	while (rest) {
+		uint32_t bit = rest & ~(rest - 1U);
+
+		ENET_DMA_STAT(base) = bit;
+		rest &= ~bit;
+	}
+}
 
 static int eth_gd32_start(const struct device *dev)
 {
@@ -793,12 +802,20 @@ static int eth_gd32_start(const struct device *dev)
 	k_sem_reset(&data->tx_done);
 	k_sem_give(&data->tx_done);
 
-	/* Event-driven RX/TX: RS/TS completions and RBU wake the RX
-	 * thread and TX waiters through the ISR.  The RX thread keeps a
-	 * slow watchdog poll as a safety net. */
+	eth_gd32_irq_srcs_quiesce(base);
+
+	/* Normal and abnormal summary plus the per-source enables; the
+	 * early-transmit / early-receive interrupts serve no purpose here. */
+	ENET_DMA_INTEN(base) = ENET_DMA_INTEN_NIE | ENET_DMA_INTEN_AIE |
+			       ENET_DMA_INTEN_RIE | ENET_DMA_INTEN_TIE |
+			       ENET_DMA_INTEN_TBUIE | ENET_DMA_INTEN_RBUIE |
+			       ENET_DMA_INTEN_TPSIE | ENET_DMA_INTEN_RPSIE |
+			       ENET_DMA_INTEN_TJTIE | ENET_DMA_INTEN_TUIE |
+			       ENET_DMA_INTEN_ROIE | ENET_DMA_INTEN_RWTIE |
+			       ENET_DMA_INTEN_FBEIE;
+
 	ENET_DMA_CTL(base) |= ENET_DMA_CTL_STE | ENET_DMA_CTL_SRE;
 	ENET_DMA_RPEN(base) = 0U;
-	ENET_DMA_INTEN(base) = ETH_GD32_DMA_INTEN;
 
 	data->started = true;
 	data->link_up = false;
@@ -880,19 +897,18 @@ static void eth_gd32_irq_config_##n(void)				\
 	PINCTRL_DT_INST_DEFINE(n);					\
 	ETH_GD32_IRQ_CONFIG(n)						\
 									\
-	/* The ENET DMA masters only perform reliably on the peripheral	\
-	 * SRAM0 (0x30000000): descriptors and frame buffers in the	\
-	 * default AXI SRAM make the DMA service them in batches with	\
-	 * seconds of latency (the vendor BSP links them to SRAM0	\
-	 * through .ARM.__at_0x30000000 scatter sections and marks the	\
-	 * region non-cacheable for the same reason).  The DT "SRAM0"	\
-	 * memory region keeps *(SRAM0) content.			\
+	/* The ENET DMA requires its descriptors in the peripheral SRAM0	\
+	 * (0x30000000); the DT "SRAM0" memory region keeps *(SRAM0)		\
+	 * content.  Frame buffers live in the default SRAM: with D-cache	\
+	 * enabled this needs CONFIG_CACHE_MANAGEMENT (the driver then		\
+	 * invalidates RX and flushes TX buffers around each DMA access);	\
+	 * with the cache maintenance in place the buffers may leave the	\
+	 * 16 KB SRAM0, which alone could not hold rings larger than 8		\
+	 * descriptors.								\
 	 */								\
-	BUILD_ASSERT(CONFIG_ETH_GD32_RX_DESC_NUM * ETH_GD32_BUF_SIZE +	\
-		     ETH_GD32_BUF_SIZE +				\
-		     (CONFIG_ETH_GD32_RX_DESC_NUM + 2U) * 16U <=	\
+	BUILD_ASSERT((CONFIG_ETH_GD32_RX_DESC_NUM + 2U) * 16U <=	\
 		     CONFIG_ETH_GD32_SRAM0_BUDGET,			\
-		     "ENET RX/TX data must fit the SRAM0 budget");	\
+		     "ENET descriptors must fit the SRAM0 budget");	\
 	K_KERNEL_STACK_DEFINE(eth_gd32_rx_stack_##n,			\
 			      CONFIG_ETH_GD32_RX_THREAD_STACK_SIZE);	\
 	static struct eth_gd32_desc					\
@@ -903,12 +919,10 @@ static void eth_gd32_irq_config_##n(void)				\
 		__aligned(4)						\
 		__attribute__((__section__("SRAM0")));			\
 	static uint8_t							\
-		eth_gd32_txbuf_##n[ETH_GD32_BUF_SIZE] __aligned(4)	\
-		__attribute__((__section__("SRAM0")));			\
+		eth_gd32_txbuf_##n[ETH_GD32_BUF_SIZE] __aligned(4);	\
 	static uint8_t eth_gd32_rxbuf_##n				\
 		[CONFIG_ETH_GD32_RX_DESC_NUM][ETH_GD32_BUF_SIZE]	\
-		__aligned(4)						\
-		__attribute__((__section__("SRAM0")));			\
+		__aligned(4);						\
 	static struct eth_gd32_data eth_gd32_data_##n = {		\
 		.txdesc = eth_gd32_txdesc_##n,				\
 		.rxdesc = eth_gd32_rxdesc_##n,				\
@@ -995,6 +1009,7 @@ static void eth_gd32_irq_config_##n(void)				\
 		}							\
 									\
 		eth_gd32_mac_addr_set(cfg->base, data->mac_addr);	\
+		eth_gd32_irq_srcs_quiesce(cfg->base);			\
 									\
 		ret = eth_gd32_phy_scan(data);				\
 		if (ret < 0) {						\
@@ -1028,3 +1043,122 @@ static void eth_gd32_irq_config_##n(void)				\
 		CONFIG_ETH_INIT_PRIORITY, &eth_gd32_api, NET_ETH_MTU);
 
 DT_INST_FOREACH_STATUS_OKAY(ETH_GD32_INIT)
+
+#ifdef CONFIG_ETH_GD32_IRQ_TEST
+/* Bring-up diagnosis: runtime INTEN control and interrupt-source counters,
+ * so an interrupt misbehaviour can be bisected over the shell without
+ * reflashing.  Compiled only with CONFIG_ETH_GD32_IRQ_TEST=y. */
+#include <stdlib.h>
+#include <zephyr/shell/shell.h>
+
+static uint32_t eth_gd32_test_base(void)
+{
+	struct eth_gd32_data *data = DEVICE_DT_INST_GET(0)->data;
+
+	return data->base;
+}
+
+static struct eth_gd32_data *eth_gd32_test_data(void)
+{
+	return DEVICE_DT_INST_GET(0)->data;
+}
+
+static int cmd_gdeth_int(const struct shell *sh, size_t argc, char **argv)
+{
+	uint32_t base = eth_gd32_test_base();
+	uint32_t mask = strtoul(argv[1], NULL, 16);
+
+	eth_gd32_irq_srcs_quiesce(base);
+	ENET_DMA_INTEN(base) = mask;
+	shell_print(sh, "INTEN = 0x%08x", mask);
+	return 0;
+}
+
+static int cmd_gdeth_off(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	ENET_DMA_INTEN(eth_gd32_test_base()) = 0U;
+	shell_print(sh, "INTEN = 0");
+	return 0;
+}
+
+static int cmd_gdeth_stat(const struct shell *sh, size_t argc, char **argv)
+{
+	struct eth_gd32_data *data = eth_gd32_test_data();
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	shell_print(sh, "entries=%u last_stat=0x%08x residual=0x%08x",
+		    data->t_entries, data->t_last_stat, data->t_residual);
+	shell_print(sh, "rs_cyc=%u wake_cyc=%u isr->thread=%u",
+		    data->t_rs_cyc, data->t_wake_cyc,
+		    data->t_wake_cyc - data->t_rs_cyc);
+	shell_print(sh, "frame=%u copy_cyc=%u (%u cyc/byte)",
+		    data->t_frame_len, data->t_copy_cyc,
+		    data->t_frame_len ? data->t_copy_cyc /
+					data->t_frame_len : 0U);
+	for (uint32_t bit = 0U; bit < 32U; bit++) {
+		if (data->t_bits[bit] != 0U) {
+			shell_print(sh, "  bit %2u (%s): %u", bit,
+				    (bit == 0)  ? "TS" :
+				    (bit == 2)  ? "TBU" :
+				    (bit == 6)  ? "RS" :
+				    (bit == 7)  ? "RBU" :
+				    (bit == 15) ? "AI" :
+				    (bit == 16) ? "NI" :
+				    (bit == 27) ? "MSC" :
+				    (bit == 28) ? "WUM" :
+				    (bit == 29) ? "TST" : "?",
+				    data->t_bits[bit]);
+		}
+	}
+	return 0;
+}
+
+static int cmd_gdeth_regs(const struct shell *sh, size_t argc, char **argv)
+{
+	uint32_t base = eth_gd32_test_base();
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	shell_print(sh, "DMA_STAT  = 0x%08x", ENET_DMA_STAT(base));
+	shell_print(sh, "DMA_INTEN = 0x%08x", ENET_DMA_INTEN(base));
+	shell_print(sh, "MAC_INTF  = 0x%08x", ENET_MAC_INTF(base));
+	shell_print(sh, "MAC_INTMSK= 0x%08x", ENET_MAC_INTMSK(base));
+	shell_print(sh, "MSC_RINTF = 0x%08x", ENET_MSC_RINTF(base));
+	shell_print(sh, "MSC_TINTF = 0x%08x", ENET_MSC_TINTF(base));
+	shell_print(sh, "MSC_RINTMSK=0x%08x", ENET_MSC_RINTMSK(base));
+	shell_print(sh, "MSC_TINTMSK=0x%08x", ENET_MSC_TINTMSK(base));
+	return 0;
+}
+
+static int cmd_gdeth_zero(const struct shell *sh, size_t argc, char **argv)
+{
+	struct eth_gd32_data *data = eth_gd32_test_data();
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	data->t_entries = 0U;
+	data->t_residual = 0U;
+	data->t_last_stat = 0U;
+	memset((void *)data->t_bits, 0, sizeof(data->t_bits));
+	shell_print(sh, "counters cleared");
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(gdeth_cmds,
+	SHELL_CMD(int, NULL, "gdeth int <hexmask>: quiesce then set INTEN",
+		  cmd_gdeth_int),
+	SHELL_CMD(off, NULL, "gdeth off: INTEN = 0", cmd_gdeth_off),
+	SHELL_CMD(stat, NULL, "gdeth stat: ISR counters", cmd_gdeth_stat),
+	SHELL_CMD(regs, NULL, "gdeth regs: interrupt register dump",
+		  cmd_gdeth_regs),
+	SHELL_CMD(zero, NULL, "gdeth zero: clear counters", cmd_gdeth_zero),
+	SHELL_SUBCMD_SET_END);
+SHELL_CMD_REGISTER(gdeth, &gdeth_cmds, "GD32 ENET IRQ diagnosis", NULL);
+#endif /* CONFIG_ETH_GD32_IRQ_TEST */

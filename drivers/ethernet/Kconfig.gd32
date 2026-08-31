@@ -30,12 +30,14 @@ config ETH_GD32_RX_THREAD_PRIO
 config ETH_GD32_RX_DESC_NUM
 	int "Number of RX DMA descriptors"
 	default 8
-	range 2 8
+	range 2 32
 	depends on ETH_GD32
 	help
 	  Size of the RX descriptor ring.  Each descriptor owns a dedicated
-	  1536-byte buffer.  The descriptors and buffers live in the
-	  peripheral SRAM0 region, which the ENET DMA requires.
+	  1536-byte buffer.  The descriptors live in the peripheral SRAM0
+	  region, which the ENET DMA requires; with cache management enabled
+	  the frame buffers can live in the default SRAM, allowing rings
+	  larger than the 16 KB SRAM0 could hold.
 
 config ETH_GD32_SRAM0_BUDGET
 	int "SRAM0 budget for ENET descriptors and buffers (bytes)"
@@ -45,3 +47,23 @@ config ETH_GD32_SRAM0_BUDGET
 	  Size of the peripheral SRAM0 region reserved for the ENET DMA
 	  descriptor ring and frame buffers.  The build fails if the
 	  configured ring does not fit.
+
+config ETH_GD32_IRQ_TEST
+	bool "GD32 ENET interrupt diagnosis hooks (bring-up only)"
+	default n
+	depends on ETH_GD32
+	select SHELL
+	help
+	  Adds a `gdeth` shell command group that controls the DMA interrupt
+	  enable register at runtime and counts the interrupt sources seen by
+	  the ISR.  For bring-up debugging only; leave off in production.
+
+config ETH_GD32_RX_BATCH
+	int "RX frames processed per wakeup"
+	default 8
+	range 1 64
+	depends on ETH_GD32
+	help
+	  Upper bound on frames the RX thread drains per wakeup before it
+	  yields to lower-priority threads (the IP stack must run to keep
+	  the TCP ACK path alive during receive bursts).
