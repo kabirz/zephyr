@@ -639,6 +639,13 @@ static void eth_gd32_isr(const struct device *dev)
  * with per-descriptor maintenance alone.  Raw PPB accesses, because
  * the CMSIS core headers are not reliably includable from this
  * translation unit. */
+/* D-cache experiments failed twice (per-descriptor maintenance, then a
+ * hand-rolled non-cacheable MPU region claimed from a free slot): both
+ * crash into a fatal-reset loop around link-up.  The prime suspect is
+ * Zephyr's own MPU management rewriting regions at runtime and undoing
+ * the non-cacheable mapping.  The correct path is a SoC-level static
+ * MPU region through the arm_mpu framework; until then the D-cache
+ * stays off - the I-cache alone recovered ~8x. */
 static void eth_gd32_enable_caches(void)
 {
 	*(volatile uint32_t *)0xE000EF50U = 0U;		/* ICIALLU */
