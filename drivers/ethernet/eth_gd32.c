@@ -639,20 +639,11 @@ static void eth_gd32_isr(const struct device *dev)
  * with per-descriptor maintenance alone.  Raw PPB accesses, because
  * the CMSIS core headers are not reliably includable from this
  * translation unit. */
-/* D-cache experiments failed twice (per-descriptor maintenance, then a
- * hand-rolled non-cacheable MPU region claimed from a free slot): both
- * crash into a fatal-reset loop around link-up.  The prime suspect is
- * Zephyr's own MPU management rewriting regions at runtime and undoing
- * the non-cacheable mapping.  The correct path is a SoC-level static
- * MPU region through the arm_mpu framework; until then the D-cache
- * stays off - the I-cache alone recovered ~8x. */
-static void eth_gd32_enable_caches(void)
-{
-	*(volatile uint32_t *)0xE000EF50U = 0U;		/* ICIALLU */
-	*(volatile uint32_t *)0xE000ED14U |= (1U << 17);	/* CCR: IC only */
-	barrier_dmem_fence_full();
-	barrier_isync_fence_full();
-}
+/* The system caches are enabled at SoC level (soc_early_init_hook):
+ * enabling them from a driver was the wrong layer.  The D-cache stays
+ * off until the descriptor SRAM gets a static non-cacheable MPU region
+ * through the arm_mpu framework - see the bring-up notes for the two
+ * failed experiments (per-descriptor maintenance, hand-rolled region). */
 
 /* TX path ----------------------------------------------------------------- */
 
@@ -1049,7 +1040,6 @@ static void eth_gd32_irq_config_##n(void)				\
 									\
 		data->base = cfg->base;					\
 		data->dev = dev;					\
-		eth_gd32_enable_caches();						\
 		k_mutex_init(&data->tx_lock);				\
 		k_sem_init(&data->tx_done, 0, 1);			\
 		k_sem_init(&data->rx_sem, 0, 1);			\
