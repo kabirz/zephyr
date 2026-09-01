@@ -27,6 +27,7 @@
 
 #include <usb_dwc2_hw.h>
 #include "usb_dc_dw_stm32.h"
+#include "usb_dc_dw_gd32.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usb_dc_dw, CONFIG_USB_DRIVER_LOG_LEVEL);
@@ -153,7 +154,8 @@ static int usb_dw_init_pinctrl(const struct usb_dw_config *const config)
 #define USB_DW_DEVICE_DEFINE(n)							\
 	USB_DW_PINCTRL_DT_INST_DEFINE(n);					\
 	USB_DW_QUIRK_ST_STM32F4_FSOTG_DEFINE(n);				\
-										\
+	USB_DW_QUIRK_GD32_USBHS_DEFINE(n);					\
+											\
 	static void usb_dw_irq_enable_func_##n(const struct device *dev)	\
 	{									\
 		IRQ_CONNECT(DT_INST_IRQN(n),					\
@@ -161,18 +163,24 @@ static int usb_dw_init_pinctrl(const struct usb_dw_config *const config)
 			    usb_dw_isr_handler,					\
 			    0,							\
 			    DW_IRQ_FLAGS(n));					\
-										\
+											\
 		irq_enable(DT_INST_IRQN(n));					\
 	}									\
-										\
+											\
 	static const struct usb_dw_config usb_dw_cfg_##n = {			\
 		.base = (struct usb_dwc2_reg *)DT_INST_REG_ADDR(n),		\
 		.pcfg = USB_DW_PINCTRL_DT_INST_DEV_CONFIG_GET(n),		\
 		.irq_enable_func = usb_dw_irq_enable_func_##n,			\
-		.clk_enable_func = USB_DW_GET_COMPAT_CLK_QUIRK_0(n),		\
-		.pwr_on_func = USB_DW_GET_COMPAT_PWR_QUIRK_0(n),		\
+		.clk_enable_func =						\
+			COND_CODE_1(DT_INST_NODE_HAS_COMPAT(n, gd_gd32_usbhs),	\
+				(clk_enable_gd32_usbhs_##n),			\
+				(USB_DW_GET_COMPAT_CLK_QUIRK_0(n))),		\
+		.pwr_on_func =							\
+			COND_CODE_1(DT_INST_NODE_HAS_COMPAT(n, gd_gd32_usbhs),	\
+				(pwr_on_gd32_usbhs),				\
+				(USB_DW_GET_COMPAT_PWR_QUIRK_0(n))),		\
 	};									\
-										\
+											\
 	static struct usb_dw_ctrl_prv usb_dw_ctrl_##n;
 
 USB_DW_DEVICE_DEFINE(0)
@@ -287,7 +295,15 @@ static int usb_dw_num_dev_eps(void)
 {
 	struct usb_dwc2_reg *const base = usb_dw_cfg.base;
 
+#if DT_INST_NODE_HAS_COMPAT(0, gd_gd32_usbhs)
+	/* GD32 fabric does not implement GHWCFG2 (reads as 0); the device
+	 * endpoint count comes from devicetree. */
+	ARG_UNUSED(base);
+
+	return DT_INST_PROP(0, num_in_eps);
+#else
 	return (base->ghwcfg2 >> 10) & 0xf;
+#endif
 }
 
 static void usb_dw_flush_tx_fifo(int ep)
@@ -315,7 +331,13 @@ static int usb_dw_set_fifo(uint8_t ep)
 	volatile uint32_t *reg = &base->in_ep[ep_idx].diepctl;
 	uint32_t val;
 	int fifo = 0;
+#if DT_INST_NODE_HAS_COMPAT(0, gd_gd32_usbhs)
+	/* GHWCFG4 reads as 0 on GD32 (register not implemented); this core
+	 * is always dedicated-FIFO mode. */
+	int ded_fifo = 1;
+#else
 	int ded_fifo = !!(base->ghwcfg4 & USB_DWC2_GHWCFG4_DEDFIFOMODE);
+#endif
 
 	if (!ded_fifo) {
 		/* No support for shared-FIFO mode yet, existing
@@ -478,10 +500,22 @@ static int usb_dw_tx(uint8_t ep, const uint8_t *const data,
 	uint32_t i;
 
 	/* Wait for FIFO space available */
+	uint32_t wait = 0;
+
 	do {
 		avail_space = usb_dw_tx_fifo_avail(ep_idx);
 		if (avail_space == usb_dw_ctrl.in_ep_ctrl[ep_idx].fifo_size) {
 			break;
+		}
+		/* Bounded wait: this can run from the ISR (control
+		 * transfers) where k_yield() cannot block.  If the host
+		 * went away with the FIFO non-empty, bail out instead of
+		 * spinning forever. */
+		if (++wait > 10000) {
+			LOG_ERR("USB IN EP%d FIFO stuck (avail %u/%u)",
+				ep_idx, avail_space,
+				usb_dw_ctrl.in_ep_ctrl[ep_idx].fifo_size);
+			return -EIO;
 		}
 		/* Make sure we don't hog the CPU */
 		k_yield();
@@ -655,6 +689,7 @@ static int usb_dw_init(void)
 static void usb_dw_handle_reset(void)
 {
 	struct usb_dwc2_reg *const base = usb_dw_cfg.base;
+	int cnt;
 
 	LOG_DBG("USB RESET event");
 
@@ -665,6 +700,22 @@ static void usb_dw_handle_reset(void)
 
 	/* Clear device address during reset. */
 	base->dcfg &= ~USB_DWC2_DCFG_DEVADDR_MASK;
+
+	/* The host may reset the bus with IN data still queued from an
+	 * abandoned control transfer.  Flush both FIFOs, otherwise
+	 * usb_dw_tx() (called from the ISR on the next SETUP) waits
+	 * forever for a FIFO that never drains and livelocks the CPU. */
+	base->grstctl = USB_DWC2_GRSTCTL_RXFFLSH;
+	for (cnt = 0; (base->grstctl & USB_DWC2_GRSTCTL_RXFFLSH) && cnt < 1000;
+	     cnt++) {
+		k_busy_wait(1);
+	}
+	base->grstctl = (0x10UL << USB_DWC2_GRSTCTL_TXFNUM_POS) |
+			USB_DWC2_GRSTCTL_TXFFLSH;
+	for (cnt = 0; (base->grstctl & USB_DWC2_GRSTCTL_TXFFLSH) && cnt < 1000;
+	     cnt++) {
+		k_busy_wait(1);
+	}
 
 	/* enable global EP interrupts */
 	base->doepmsk = 0U;

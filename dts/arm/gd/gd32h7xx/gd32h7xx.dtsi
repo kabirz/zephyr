@@ -478,6 +478,25 @@
 			status = "disabled";
 		};
 
+		/* USBHS0 is a DesignWare DWC2 OTG core.  The GD32 fabric does
+		 * not implement the read-only GHWCFG identity registers (they
+		 * read as 0), so the device endpoint capabilities are given
+		 * statically: 6 IN / 4 OUT endpoints, dedicated-FIFO mode
+		 * (per the SVD DIEP0..5TFLEN register set).  The 48MHz PHY
+		 * reference is selected by the driver quirk (IRC48M). */
+		usbhs0: usb@40040000 {
+			compatible = "gd,gd32-usbhs", "snps,dwc2";
+			reg = <0x40040000 0x1000>;
+			interrupts = <77 0>;
+			num-in-eps = <6>;
+			num-out-eps = <4>;
+			ghwcfg1 = <0x0>;
+			ghwcfg2 = <0x0>;
+			ghwcfg4 = <0x0>;
+			clocks = <&cctl GD32_CLOCK_USBHS0>;
+			status = "disabled";
+		};
+
 		trng: rng@48021800 {
 			compatible = "gd,gd32-trng";
 			reg = <0x48021800 0x400>;

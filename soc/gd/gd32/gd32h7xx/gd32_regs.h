@@ -35,4 +35,8 @@
 #define RCU_CFG1_TIMERSEL_POS 24U
 #define RCU_CFG1_TIMERSEL_MSK (BIT_MASK(1) << RCU_CFG1_TIMERSEL_POS)
 
+/* device electronic signature: memory density info at 0x1FF0F7E0, the
+ * 96-bit unique ID follows at 0x1FF0F7E8 (GD32H7xx user manual) */
+#define GD32_UID_BASE 0x1FF0F7E8U
+
 #endif /* SOC_GD_GD32_GD32H7XX_GD32_REGS_H_ */

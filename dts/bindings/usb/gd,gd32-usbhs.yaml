@@ -1,0 +1,15 @@
+# Copyright (c) 2026 GD32H7xx Zephyr bring-up
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  GigaDevice GD32H7xx USBHS device controller (DesignWare DWC2 OTG core).
+
+  The GD32 fabric does not implement the read-only GHWCFG1/2/4 identity
+  registers (they read back as 0), so the device endpoint capabilities are
+  given statically here.  The GD32H7xx USBHS provides 6 IN and 4 OUT device
+  endpoints (including control endpoint 0) in dedicated-FIFO mode (per the
+  SVD: DIEP0..5 TFLEN registers).
+
+compatible: "gd,gd32-usbhs"
+
+include: snps,dwc2.yaml
