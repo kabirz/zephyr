@@ -52,6 +52,7 @@ struct udc_dwc2_config {
 	void (*irq_disable_func)(const struct device *dev);
 	uint32_t ghwcfg1;
 	uint32_t ghwcfg2;
+	uint32_t ghwcfg3;
 	uint32_t ghwcfg4;
 };
 

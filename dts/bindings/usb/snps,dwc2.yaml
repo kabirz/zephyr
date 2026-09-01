@@ -51,3 +51,11 @@ properties:
     description: |
       Value of the GHWCFG4 register. It is used to determine available endpoint
       types during driver pre-initialization.
+
+  ghwcfg3:
+    type: int
+    description: |
+      Value of the GHWCFG3 register (device FIFO depth, packet count and
+      transfer size widths). Only used by the driver when the hardware
+      GHWCFGn identity registers are not implemented and read back as
+      zero (e.g. GigaDevice GD32H7xx USBHS).

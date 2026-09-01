@@ -479,20 +479,29 @@
 		};
 
 		/* USBHS0 is a DesignWare DWC2 OTG core.  The GD32 fabric does
-		 * not implement the read-only GHWCFG identity registers (they
-		 * read as 0), so the device endpoint capabilities are given
-		 * statically: 6 IN / 4 OUT endpoints, dedicated-FIFO mode
-		 * (per the SVD DIEP0..5TFLEN register set).  The 48MHz PHY
-		 * reference is selected by the driver quirk (IRC48M). */
+		 * not implement the read-only GHWCFGn identity registers (they
+		 * read back as 0), so the core capabilities are described
+		 * statically here and the drivers fall back to them:
+		 *   GHWCFG1 0x500: ep0-3 bidirectional, ep4-5 IN only
+		 *   GHWCFG2 0x1506: 6 device endpoints, dedicated FS PHY,
+		 *                   no HS PHY (OTGMODE=6, FSPHYTYPE=1,
+		 *                   NUMDEVEPS=5), slave (non-DMA) architecture
+		 *   GHWCFG3 0x04000024: 1024 dword FIFO RAM, 64 max packet
+		 *                   count, 32767 byte max transfer size
+		 *   GHWCFG4 0x16200000: dedicated FIFO mode, 6 IN endpoints,
+		 *                   8-bit PHY data width
+		 * The 48MHz PHY reference (IRC48M) is selected by the driver
+		 * vendor quirk. */
 		usbhs0: usb@40040000 {
 			compatible = "gd,gd32-usbhs", "snps,dwc2";
 			reg = <0x40040000 0x1000>;
 			interrupts = <77 0>;
 			num-in-eps = <6>;
 			num-out-eps = <4>;
-			ghwcfg1 = <0x0>;
-			ghwcfg2 = <0x0>;
-			ghwcfg4 = <0x0>;
+			ghwcfg1 = <0x00000500>;
+			ghwcfg2 = <0x00001506>;
+			ghwcfg3 = <0x04000024>;
+			ghwcfg4 = <0x16200000>;
 			clocks = <&cctl GD32_CLOCK_USBHS0>;
 			status = "disabled";
 		};

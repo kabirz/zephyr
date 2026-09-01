@@ -714,6 +714,166 @@ DT_INST_FOREACH_STATUS_OKAY(QUIRK_ESP32_USB_OTG_DEFINE)
 
 #endif /*DT_HAS_COMPAT_STATUS_OKAY(espressif_esp32_usb_otg) */
 
+#if DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_usbhs)
+
+#include <errno.h>
+#include <zephyr/drivers/clock_control.h>
+#include <zephyr/drivers/clock_control/gd32.h>
+#include <zephyr/dt-bindings/clock/gd32h7xx-clocks.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/sys_io.h>
+
+/*
+ * GigaDevice GD32H7xx USBHS bring-up, following the GigaDevice V1.6.0
+ * firmware library (Examples/USBHS/usb_device).  The DWC2 core needs:
+ *
+ *  1. PMU 3.3V USB supply regulator enabled before touching the PHY
+ *     (PMU_CTL2 @ APB4 0x58005800: USBSEN + VUSB33DEN, wait USB33RF).
+ *  2. IRC48M as the 48MHz PHY reference (RCU_ADDCTL0 + USBCLKCTL).
+ *  3. The embedded full-speed PHY selected in GUSBCS (bit 6) before any
+ *     core soft reset - the reset handshake needs the core clock.
+ *  4. After controller init: clear stale OTG flags, restart the PHY
+ *     clock (PWRCLKCTL), force B-session valid via the GigaDevice
+ *     GOTGCS override bits (6/7, NOT the STM32 positions), power the
+ *     transceiver (GCCFG bit 16), and set DevSpd=1 - the core is an
+ *     HS core with the embedded FS PHY, for which the GigaDevice
+ *     library uses DS=1 while the generic FS path programs 3 and the
+ *     device would never answer the host.
+ */
+
+#define GD32_PMU_CTL2_OFF   0x10
+#define GD32_RCU_ADDCTL0_OFF 0xC0
+#define GD32_RCU_USBCLKCTL_OFF 0xD4
+
+#define GD32_PMU_VUSB33DEN  BIT(24)
+#define GD32_PMU_USBSEN     BIT(25)
+#define GD32_PMU_USB33RF    BIT(26)
+#define GD32_RCU_IRC48MEN   BIT(16)
+#define GD32_RCU_IRC48MSTB  BIT(17)
+#define GD32_GUSBCS_EMBPHY_FS BIT(6)
+#define GD32_GOTGCS_BVOE    BIT(6)
+#define GD32_GOTGCS_BVOV    BIT(7)
+#define GD32_GCCFG_PWRON    BIT(16)
+
+static inline int gd32_usbhs_wait_bits(mem_addr_t addr, uint32_t mask)
+{
+	for (int t = 0; !(sys_read32(addr) & mask) && t < 100000; t++) {
+		k_busy_wait(1);
+	}
+
+	return (sys_read32(addr) & mask) ? 0 : -ETIMEDOUT;
+}
+
+static inline int gd32_usbhs_init(const struct device *dev)
+{
+	const struct udc_dwc2_config *const config = dev->config;
+	static const uint16_t clk_pmu = GD32_CLOCK_PMU;
+	static const uint16_t clk_usbhs0 = GD32_CLOCK_USBHS0;
+	mem_addr_t gusbcfg_reg = (mem_addr_t)&config->base->gusbcfg;
+	int ret;
+
+	if (!device_is_ready(GD32_CLOCK_CONTROLLER)) {
+		return -ENODEV;
+	}
+
+	ret = clock_control_on(GD32_CLOCK_CONTROLLER,
+			       (clock_control_subsys_t)&clk_pmu);
+	if (ret) {
+		return ret;
+	}
+
+	ret = clock_control_on(GD32_CLOCK_CONTROLLER,
+			       (clock_control_subsys_t)&clk_usbhs0);
+	if (ret) {
+		return ret;
+	}
+
+	/* 3.3V USB supply must be up before touching the PHY */
+	sys_set_bits(0x58005800UL + GD32_PMU_CTL2_OFF,
+		     GD32_PMU_USBSEN | GD32_PMU_VUSB33DEN);
+	ret = gd32_usbhs_wait_bits(0x58005800UL + GD32_PMU_CTL2_OFF,
+				   GD32_PMU_USB33RF);
+	if (ret) {
+		return ret;
+	}
+
+	/* 48MHz PHY reference from IRC48M */
+	sys_set_bits(0x58024400UL + GD32_RCU_ADDCTL0_OFF, GD32_RCU_IRC48MEN);
+	ret = gd32_usbhs_wait_bits(0x58024400UL + GD32_RCU_ADDCTL0_OFF,
+				   GD32_RCU_IRC48MSTB);
+	if (ret) {
+		return ret;
+	}
+	sys_clear_bits(0x58024400UL + GD32_RCU_USBCLKCTL_OFF, BIT_MASK(2) << 5);
+	sys_set_bits(0x58024400UL + GD32_RCU_USBCLKCTL_OFF, 3U << 5);
+
+	/* embedded FS PHY before the core soft reset */
+	sys_set_bits(gusbcfg_reg, GD32_GUSBCS_EMBPHY_FS);
+	k_busy_wait(10);
+
+	return 0;
+}
+
+static inline int gd32_usbhs_pre_enable(const struct device *dev)
+{
+	const struct udc_dwc2_config *const config = dev->config;
+	mem_addr_t gotgctl_reg = (mem_addr_t)&config->base->gotgctl;
+	mem_addr_t gotgint_reg = (mem_addr_t)&config->base->gotgint;
+	mem_addr_t ggpio_reg = (mem_addr_t)&config->base->ggpio;
+	mem_addr_t pwrclk_reg = (mem_addr_t)config->base + 0xE00UL;
+
+	/* clear stale OTG interrupt flags (ID pin change etc.) */
+	sys_write32(0xFFFFFFFFUL, gotgint_reg);
+
+	/* restart the PHY clock: clear power-down clock gating.  This must
+	 * happen before udc_dwc2_init_controller() - the FIFO flushes in
+	 * the endpoint activation path need the PHY clock and would hang
+	 * on a gated core. */
+	sys_write32(0, pwrclk_reg);
+
+	/* power the FS transceiver, force B-session valid */
+	sys_set_bits(gotgctl_reg, GD32_GOTGCS_BVOE | GD32_GOTGCS_BVOV);
+	sys_set_bits(ggpio_reg, GD32_GCCFG_PWRON);
+
+	return 0;
+}
+
+static inline int gd32_usbhs_post_enable(const struct device *dev)
+{
+	const struct udc_dwc2_config *const config = dev->config;
+	mem_addr_t gotgctl_reg = (mem_addr_t)&config->base->gotgctl;
+	mem_addr_t gusbcfg_reg = (mem_addr_t)&config->base->gusbcfg;
+	mem_addr_t dcfg_reg = (mem_addr_t)&config->base->dcfg;
+
+	/* HS core with embedded FS PHY wants DevSpd=1; the generic FS path
+	 * programmed 3 during controller init */
+	sys_clear_bits(dcfg_reg, USB_DWC2_DCFG_DEVSPD_MASK);
+	sys_set_bits(dcfg_reg, USB_DWC2_DCFG_DEVSPD_USBFS20);
+
+	/* re-assert the B-session override: the controller initialization
+	 * clears the GOTGCS override bits on this core */
+	sys_set_bits(gotgctl_reg, GD32_GOTGCS_BVOE | GD32_GOTGCS_BVOV);
+
+	/* restore the reset-default turnaround time (USBTNR=5): the
+	 * generic controller init rewrites GUSBCS from scratch and clears
+	 * it, breaking every IN transaction with host-side EPROTO */
+	sys_clear_bits(gusbcfg_reg, 0xFUL << 10);
+	sys_set_bits(gusbcfg_reg, 0x5UL << 10);
+
+	return 0;
+}
+
+#define QUIRK_GD32_USBHS_DEFINE(n)						\
+	const struct dwc2_vendor_quirks dwc2_vendor_quirks_##n = {		\
+		.init = gd32_usbhs_init,					\
+		.pre_enable = gd32_usbhs_pre_enable,				\
+		.post_enable = gd32_usbhs_post_enable,				\
+	};									\
+
+DT_INST_FOREACH_STATUS_OKAY(QUIRK_GD32_USBHS_DEFINE)
+
+#endif /*DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_usbhs) */
+
 /* Add next vendor quirks definition above this line */
 
 #endif /* ZEPHYR_DRIVERS_USB_UDC_DWC2_VENDOR_QUIRKS_H */

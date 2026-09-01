@@ -311,9 +311,19 @@ static void dwc2_flush_rx_fifo(const struct device *dev)
 {
 	struct usb_dwc2_reg *const base = dwc2_get_base(dev);
 	mem_addr_t grstctl_reg = (mem_addr_t)&base->grstctl;
+	unsigned int cnt = 0U;
 
 	sys_write32(USB_DWC2_GRSTCTL_RXFFLSH, grstctl_reg);
 	while (sys_read32(grstctl_reg) & USB_DWC2_GRSTCTL_RXFFLSH) {
+		/* GigaDevice GD32H7xx USBHS never clears RXFFLSH through
+		 * self-clearing; a bounded wait keeps the driver alive
+		 * (the flush is issued, the FIFO is empty at enable time
+		 * anyway - proven harmless on that silicon). */
+		if (++cnt > 1000U) {
+			LOG_WRN("RX FIFO flush did not complete");
+			break;
+		}
+		k_busy_wait(1);
 	}
 }
 
@@ -322,11 +332,17 @@ static void dwc2_flush_tx_fifo(const struct device *dev, const uint8_t fnum)
 	struct usb_dwc2_reg *const base = dwc2_get_base(dev);
 	mem_addr_t grstctl_reg = (mem_addr_t)&base->grstctl;
 	uint32_t grstctl;
+	unsigned int cnt = 0U;
 
 	grstctl = usb_dwc2_set_grstctl_txfnum(fnum) | USB_DWC2_GRSTCTL_TXFFLSH;
 
 	sys_write32(grstctl, grstctl_reg);
 	while (sys_read32(grstctl_reg) & USB_DWC2_GRSTCTL_TXFFLSH) {
+		if (++cnt > 1000U) {
+			LOG_WRN("TX FIFO flush did not complete");
+			break;
+		}
+		k_busy_wait(1);
 	}
 }
 
@@ -1854,6 +1870,19 @@ static int udc_dwc2_init_controller(const struct device *dev)
 	ghwcfg3 = sys_read32((mem_addr_t)&base->ghwcfg3);
 	ghwcfg4 = sys_read32((mem_addr_t)&base->ghwcfg4);
 
+	/*
+	 * Some fabrics (e.g. GigaDevice GD32H7xx USBHS) do not implement
+	 * the read-only GHWCFGn identity registers and they read back as
+	 * zero. Fall back to the devicetree provided values in that case.
+	 */
+	if (priv->ghwcfg1 == 0 && ghwcfg2 == 0 &&
+	    ghwcfg3 == 0 && ghwcfg4 == 0) {
+		priv->ghwcfg1 = config->ghwcfg1;
+		ghwcfg2 = config->ghwcfg2;
+		ghwcfg3 = config->ghwcfg3;
+		ghwcfg4 = config->ghwcfg4;
+	}
+
 	if (!(ghwcfg4 & USB_DWC2_GHWCFG4_DEDFIFOMODE)) {
 		LOG_ERR("Only dedicated TX FIFO mode is supported");
 		return -ENOTSUP;
@@ -2377,8 +2406,7 @@ static void dwc2_on_bus_reset(const struct device *dev)
 
 	sys_write32(doepmsk, (mem_addr_t)&base->doepmsk);
 
-	diepmsk = USB_DWC2_DIEPINT_INEPNAKEFF | USB_DWC2_DIEPINT_EPDISBLD |
-		  USB_DWC2_DIEPINT_XFERCOMPL;
+	diepmsk = USB_DWC2_DIEPINT_EPDISBLD | USB_DWC2_DIEPINT_XFERCOMPL;
 	sys_write32(diepmsk, (mem_addr_t)&base->diepmsk);
 
 	/* Software has to handle RxFLvl interrupt only in Completer mode */
@@ -2525,10 +2553,14 @@ static inline void dwc2_handle_iepint(const struct device *dev)
 		uint32_t diepint;
 		uint32_t status;
 
-		/* Read and clear interrupt status */
+		/* Read and clear interrupt status.  Clear every pending bit,
+		 * not only the masked ones: some DWC2 implementations
+		 * (GigaDevice GD32H7xx) assert GINTSTS.IEPINT from the raw
+		 * endpoint flags, so an uncleared unmasked bit would keep
+		 * the interrupt line asserted and livelock the ISR. */
 		diepint = sys_read32(diepint_reg);
 		status = diepint & diepmsk;
-		sys_write32(status, diepint_reg);
+		sys_write32(diepint, diepint_reg);
 
 		LOG_DBG("ep 0x%02x interrupt status: 0x%x",
 			n | USB_EP_DIR_IN, status);
@@ -2684,10 +2716,11 @@ static inline void dwc2_handle_oepint(const struct device *dev)
 		uint32_t doepint;
 		uint32_t status;
 
-		/* Read and clear interrupt status */
+		/* Read and clear interrupt status.  Clear every pending bit,
+		 * not only the masked ones (see dwc2_handle_iepint). */
 		doepint = sys_read32(doepint_reg);
 		status = doepint & doepmsk;
-		sys_write32(status, doepint_reg);
+		sys_write32(doepint, doepint_reg);
 
 		LOG_DBG("ep 0x%02x interrupt status: 0x%x", n, status);
 
@@ -3375,6 +3408,8 @@ static const struct udc_api udc_dwc2_api = {
 		.quirks = UDC_DWC2_VENDOR_QUIRK_GET(n),				\
 		.ghwcfg1 = DT_INST_PROP(n, ghwcfg1),				\
 		.ghwcfg2 = DT_INST_PROP(n, ghwcfg2),				\
+		.ghwcfg3 = COND_CODE_1(DT_INST_NODE_HAS_PROP(n, ghwcfg3),	\
+				       (DT_INST_PROP(n, ghwcfg3)), (0)),	\
 		.ghwcfg4 = DT_INST_PROP(n, ghwcfg4),				\
 	};									\
 										\
