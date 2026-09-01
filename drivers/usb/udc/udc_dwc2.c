@@ -2407,6 +2407,13 @@ static void dwc2_on_bus_reset(const struct device *dev)
 	sys_write32(doepmsk, (mem_addr_t)&base->doepmsk);
 
 	diepmsk = USB_DWC2_DIEPINT_EPDISBLD | USB_DWC2_DIEPINT_XFERCOMPL;
+#if !DT_HAS_COMPAT_STATUS_OKAY(gd_gd32_usbhs)
+	diepmsk |= USB_DWC2_DIEPINT_INEPNAKEFF;
+#endif
+	/* On GigaDevice GD32H7xx INEPNAKEFF is a level-sticky condition
+	 * (EP0 NAK-effective is the idle state): with the bit enabled in
+	 * DIEPMSK, GINTSTS.IEPINT stays asserted forever and the ISR
+	 * livelocks.  The GigaDevice library only enables XFERCOMPL. */
 	sys_write32(diepmsk, (mem_addr_t)&base->diepmsk);
 
 	/* Software has to handle RxFLvl interrupt only in Completer mode */
