@@ -96,6 +96,7 @@ struct eth_renesas_ra_data {
 struct eth_renesas_ra_config {
 	struct net_eth_mac_config mcfg;
 	uint8_t phy_conn_type;
+	bool no_txc_delay;
 	const struct pinctrl_dev_config *pin_cfg;
 	const struct device *phy_dev;
 };
@@ -225,7 +226,7 @@ static void phy_type_setting(const struct device *dev)
 		break;
 
 	case 3: /* RGMII */
-		*p_miicr_register = (R_ESWM_MIICR0_TXCIDE_Msk | 1);
+		*p_miicr_register = 1 | (config->no_txc_delay ? 0 : R_ESWM_MIICR0_TXCIDE_Msk);
 
 		/* Enable TXC generation.  */
 		R_ESWM->MIIRR =
@@ -745,6 +746,7 @@ DEVICE_DT_INST_DEFINE(0, renesas_ra_eswm_init, NULL, &eswm_data, &eswm_config, P
 	static struct eth_renesas_ra_config eth##n##_renesas_ra_config = {                         \
 		.mcfg = NET_ETH_MAC_DT_INST_CONFIG_INIT(n),                                        \
 		.phy_conn_type = DT_INST_ENUM_IDX(n, phy_connection_type),                         \
+		.no_txc_delay = DT_INST_PROP(n, renesas_no_txc_delay),                         \
 		.pin_cfg = PINCTRL_DT_INST_DEV_CONFIG_GET(n),                                      \
 		.phy_dev = DEVICE_DT_GET(DT_INST_PHANDLE(n, phy_handle)),                          \
 	};                                                                                         \

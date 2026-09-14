@@ -26,6 +26,14 @@ properties:
       "xtal": use xtal as clock source
       "internal": use ETHPHYCLK pin output as clock source
 
+  renesas,no-txc-delay:
+    type: boolean
+    description: |
+      Do not enable the MAC internal TXC delay (MIICRn TXCIDE) in RGMII
+      mode. Set this when the PHY already provides the TXC/RXC delays
+      (e.g. RTL8211F with delay straps) - stacking both delays shifts
+      the sampling window outside the RGMII DDR eye at 1000 Mbps.
+
   txq-num:
     type: int
     default: 2
