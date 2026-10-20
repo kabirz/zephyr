@@ -80,6 +80,18 @@ config NET_ARP_TABLE_SIZE
 	help
 	  Each entry in the ARP table consumes 48 bytes of memory.
 
+config NET_ARP_PENDING_QUEUE_LEN
+	int "Max packets queued per pending ARP entry"
+	depends on NET_ARP
+	default 3
+	help
+	  Packets sent to an address whose ARP resolution is still pending are
+	  queued until resolution or ARP_REQUEST_TIMEOUT (2s). Because every
+	  queued packet holds a TX net_pkt/net_buf from the shared pools, an
+	  unresponsive peer would otherwise drain the pools and starve all
+	  other TX users (ICMP echo replies, ARP replies, UDP). Packets
+	  beyond this limit are dropped with -ENOBUFS.
+
 config NET_ARP_GRATUITOUS
 	bool "Support gratuitous ARP requests/replies."
 	depends on NET_ARP

@@ -12,6 +12,7 @@
 LOG_MODULE_REGISTER(net_arp, CONFIG_NET_ARP_LOG_LEVEL);
 
 #include <errno.h>
+#include <zephyr/sys/sflist.h>
 #include <zephyr/net/net_core.h>
 #include <zephyr/net/net_pkt.h>
 #include <zephyr/net/net_if.h>
@@ -441,8 +442,26 @@ int net_arp_prepare(struct net_pkt *pkt,
 			 * in the pending list and if so, resend the request, otherwise just
 			 * append the packet to the request fifo list.
 			 * Ensure the packet reference is incremented to account for the queue
-			 * holding the reference.
+			 * holding the reference. The queue is capped so that a peer that never
+			 * answers ARP cannot exhaust the shared TX net_pkt pool: every queued
+			 * packet is held until ARP_REQUEST_TIMEOUT and an unbounded queue
+			 * starves other TX users (ICMP echo replies, ARP replies, UDP).
 			 */
+			size_t qlen = 0;
+
+			for (sys_sfnode_t *n =
+				     sys_sflist_peek_head(&entry->pending_queue._queue.data_q);
+			     n != NULL; n = sys_sflist_peek_next(n)) {
+				qlen++;
+			}
+
+			if (qlen >= CONFIG_NET_ARP_PENDING_QUEUE_LEN) {
+				NET_DBG("Pending ARP queue for %s full, dropping pkt %p",
+					net_sprint_ipv4_addr(addr), pkt);
+				k_mutex_unlock(&arp_mutex);
+				return -ENOBUFS;
+			}
+
 			pkt = net_pkt_ref(pkt);
 			if (k_queue_unique_append(&entry->pending_queue._queue, pkt)) {
 				NET_DBG("Pending ARP request for %s, queuing pkt %p",
